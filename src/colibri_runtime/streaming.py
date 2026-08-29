@@ -249,6 +249,8 @@ class ExpertStore:
             self._freq[layer].update(routed)
             self._recent[layer].append(selected)
             self.stats.routes += len(routed)
+            for expert in selected:
+                self.cache.mark_hot((layer, expert), self._freq[layer][expert] >= 4)
 
     def prefetch_predictions(self, layer: int, selected: Iterable[int]) -> None:
         if not self.prefetch_count:

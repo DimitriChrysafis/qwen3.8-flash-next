@@ -168,6 +168,6 @@ class ExpertCache:
     def snapshot(self) -> dict[str, int | str | None]:
         with self._lock:
             out = asdict(self.stats)
-            out.update(size=len(self._items), max_items=self.max_items,
-                       max_bytes=self.max_bytes, policy=self.policy)
+            out.update(size=len(self._items), hot=sum(entry.hot for entry in self._items.values()),
+                       max_items=self.max_items, max_bytes=self.max_bytes, policy=self.policy)
             return out
