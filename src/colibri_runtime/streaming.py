@@ -78,7 +78,7 @@ class ExpertStore:
         pinned: Iterable[tuple[int, int]] = (),
     ):
         self.index = index
-        self.cache = ExpertCache(max_bytes=budget_bytes, policy=policy)
+        self.cache = ExpertCache(max_bytes=budget_bytes, policy=policy, partitions=num_layers)
         self.num_layers = num_layers
         self.num_experts = num_experts
         self.group_size = group_size

@@ -34,15 +34,20 @@ class ExpertCache:
         max_items: int | None = None,
         max_bytes: int | None = None,
         policy: str = "adaptive",
+        partitions: int | None = None,
     ) -> None:
         if max_items is None and max_bytes is None:
             raise ValueError("max_items or max_bytes is required")
         if policy not in {"lru", "lfu", "adaptive"}:
             raise ValueError("policy must be lru, lfu, or adaptive")
+        if partitions is not None and partitions < 1:
+            raise ValueError("partitions must be positive")
         self.max_items = max_items
         self.max_bytes = max_bytes
         self.policy = policy
+        self.partitions = partitions
         self._items: OrderedDict[Hashable, _Entry] = OrderedDict()
+        self._partition_usage: dict[Hashable, int] = {}
         self.stats = CacheStats()
         self._lock = threading.RLock()
 
@@ -83,6 +88,7 @@ class ExpertCache:
             old = self._items.pop(key, None)
             if old is not None:
                 self.stats.bytes -= old.nbytes
+                self._adjust_partition(key, -old.nbytes)
                 pin = pin or old.pinned
                 hot = hot or old.hot
             if self.max_bytes is not None and size > self.max_bytes:
@@ -97,9 +103,11 @@ class ExpertCache:
                     return False
                 entry = self._items.pop(victim)
                 self.stats.bytes -= entry.nbytes
+                self._adjust_partition(victim, -entry.nbytes)
                 self.stats.evictions += 1
             self._items[key] = _Entry(value, size, pin, hot, 1, monotonic())
             self.stats.bytes += size
+            self._adjust_partition(key, size)
             self.stats.peak_bytes = max(self.stats.peak_bytes, self.stats.bytes)
             self._update_pinned()
             return True
@@ -132,6 +140,21 @@ class ExpertCache:
         return ((self.max_items is not None and len(self._items) > self.max_items) or
                 (self.max_bytes is not None and self.stats.bytes > self.max_bytes))
 
+    @staticmethod
+    def _partition(key: Hashable):
+        return key[0] if isinstance(key, tuple) and key else None
+
+    def _adjust_partition(self, key: Hashable, delta: int) -> None:
+        partition = self._partition(key)
+        value = self._partition_usage.get(partition, 0) + delta
+        if value:
+            self._partition_usage[partition] = value
+        else:
+            self._partition_usage.pop(partition, None)
+
+    def _partition_bytes(self):
+        return dict(self._partition_usage)
+
     def _victim(self, protected: Hashable | None = None) -> Hashable | None:
         candidates = [(k, e) for k, e in self._items.items() if not e.pinned and k != protected]
         if not candidates:
@@ -139,6 +162,12 @@ class ExpertCache:
                 e = self._items.get(protected)
                 return protected if e is not None and not e.pinned else None
             return None
+        if self.partitions is not None and self.max_bytes is not None:
+            usage = self._partition_bytes()
+            fair = self.max_bytes / self.partitions
+            over = [(key, entry) for key, entry in candidates
+                    if usage.get(self._partition(key), 0) > fair]
+            candidates = over or candidates
         cold = [(k, e) for k, e in candidates if not e.hot]
         candidates = cold or candidates
         if self.policy == "lru":
@@ -159,15 +188,19 @@ class ExpertCache:
                 break
             entry = self._items.pop(victim)
             self.stats.bytes -= entry.nbytes
+            self._adjust_partition(victim, -entry.nbytes)
             self.stats.evictions += 1
         self._update_pinned()
 
     def _update_pinned(self) -> None:
         self.stats.pinned = sum(entry.pinned for entry in self._items.values())
 
-    def snapshot(self) -> dict[str, int | str | None]:
+    def snapshot(self) -> dict:
         with self._lock:
             out = asdict(self.stats)
             out.update(size=len(self._items), hot=sum(entry.hot for entry in self._items.values()),
-                       max_items=self.max_items, max_bytes=self.max_bytes, policy=self.policy)
+                       max_items=self.max_items, max_bytes=self.max_bytes, policy=self.policy,
+                       partitions=self.partitions)
+            if self.partitions is not None:
+                out["partition_bytes"] = {str(key): value for key, value in self._partition_bytes().items()}
             return out
