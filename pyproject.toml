@@ -2,6 +2,16 @@
 name = "qwen38next-local"
 version = "0.1.0"
 requires-python = ">=3.11"
+dependencies = [
+  "mlx>=0.32.0",
+  "mlx-lm>=0.31.0",
+  "numpy>=1.26",
+  "psutil>=5.9",
+  "safetensors>=0.4",
+]
+
+[project.scripts]
+colibri-qwen = "colibri_runtime.cli:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

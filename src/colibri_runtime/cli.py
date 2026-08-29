@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+import argparse
+import json
+import time
+
+import mlx.core as mx
+
+from .generation import generate_tokens, metrics
+from .load import load
+
+
+def _bytes_gib(value):
+    return int(float(value) * (1 << 30))
+
+
+def _parser():
+    parser = argparse.ArgumentParser(prog="colibri-qwen")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--expert-budget-gib", type=float, default=8.0)
+    parser.add_argument("--ple-budget-gib", type=float, default=1.0)
+    parser.add_argument("--cache-policy", choices=["lru", "lfu", "adaptive"], default="adaptive")
+    parser.add_argument("--io-workers", type=int, default=6)
+    parser.add_argument("--expert-prefetch", type=int, default=2)
+    parser.add_argument("--ple-prefetch", type=int, default=8)
+    sub = parser.add_subparsers(dest="command", required=True)
+    gen = sub.add_parser("generate")
+    gen.add_argument("--prompt", required=True)
+    gen.add_argument("--max-tokens", type=int, default=64)
+    gen.add_argument("--temperature", type=float, default=0.0)
+    gen.add_argument("--top-p", type=float, default=1.0)
+    gen.add_argument("--seed", type=int, default=0)
+    bench = sub.add_parser("benchmark")
+    bench.add_argument("--prompt", required=True)
+    bench.add_argument("--max-tokens", type=int, default=32)
+    bench.add_argument("--runs", type=int, default=1)
+    bench.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
+    mx.reset_peak_memory()
+    t0 = time.perf_counter()
+    model, tokenizer = load(
+        args.model,
+        expert_budget_bytes=_bytes_gib(args.expert_budget_gib),
+        ple_budget_bytes=_bytes_gib(args.ple_budget_gib),
+        cache_policy=args.cache_policy,
+        io_workers=args.io_workers,
+        prefetch_experts=args.expert_prefetch,
+        prefetch_ple=args.ple_prefetch,
+    )
+    loaded = time.perf_counter() - t0
+    ids = tokenizer.encode(args.prompt)
+    eos = model.args.text.eos_token_id
+    if args.command == "generate":
+        decoder = tokenizer.decode
+        generated, timing = generate_tokens(
+            model, ids, args.max_tokens, args.temperature, args.top_p, eos, args.seed,
+            on_token=lambda token: print(decoder([token]), end="", flush=True),
+        )
+        print()
+        print(json.dumps(metrics(model, len(ids), len(generated), timing, loaded), indent=2))
+    else:
+        reports = []
+        for run in range(args.runs):
+            generated, timing = generate_tokens(model, ids, args.max_tokens, 0.0, 1.0, eos, run)
+            reports.append(metrics(model, len(ids), len(generated), timing, loaded if run == 0 else 0.0))
+        print(json.dumps(reports if args.runs > 1 else reports[0], indent=2))
+    model.expert_store.close()
+    model.ple_store.close()
+    model.expert_store.index.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

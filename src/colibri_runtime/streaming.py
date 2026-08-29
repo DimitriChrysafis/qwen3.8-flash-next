@@ -1,0 +1,415 @@
+# Copyright 2026 The Qwen Team, The HuggingFace Inc. team, and PipeNetwork contributors.
+# Licensed under the Apache License, Version 2.0.
+from __future__ import annotations
+
+import threading
+import time
+from collections import Counter, defaultdict, deque
+from concurrent.futures import Future
+from dataclasses import asdict, dataclass
+from typing import Iterable
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+from .expert_cache import ExpertCache
+from .storage import SafeTensorIndex
+
+
+def _to_mlx(value, dtype_name: str):
+    if value is None or isinstance(value, mx.array):
+        return value
+    out = mx.array(value)
+    return out.view(mx.bfloat16) if dtype_name == "BF16" else out
+
+
+@dataclass
+class StreamStats:
+    loads: int = 0
+    load_seconds: float = 0.0
+    loaded_bytes: int = 0
+    prefetch_submitted: int = 0
+    prefetch_hits: int = 0
+    prefetch_wasted: int = 0
+    routes: int = 0
+    rows_requested: int = 0
+    unique_rows: int = 0
+
+
+@dataclass
+class LinearSlice:
+    weight: mx.array
+    scales: mx.array | None = None
+    biases: mx.array | None = None
+    group_size: int = 64
+    bits: int = 4
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.scales is None:
+            return x @ self.weight.T
+        return mx.quantized_matmul(x, self.weight, self.scales, self.biases,
+                                   group_size=self.group_size, bits=self.bits)
+
+
+@dataclass
+class ExpertSlice:
+    gate: LinearSlice
+    up: LinearSlice
+    down: LinearSlice
+    nbytes: int
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down(nn.silu(self.gate(x)) * self.up(x))
+
+
+class ExpertStore:
+    def __init__(
+        self,
+        index: SafeTensorIndex,
+        budget_bytes: int,
+        num_layers: int,
+        num_experts: int,
+        group_size: int = 64,
+        bits: int = 4,
+        policy: str = "adaptive",
+        prefetch: int = 2,
+        pinned: Iterable[tuple[int, int]] = (),
+    ):
+        self.index = index
+        self.cache = ExpertCache(max_bytes=budget_bytes, policy=policy)
+        self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.group_size = group_size
+        self.bits = bits
+        self.prefetch_count = max(0, prefetch)
+        self.stats = StreamStats()
+        self._futures: dict[tuple[int, int], Future] = {}
+        self._future_prefetch: set[tuple[int, int]] = set()
+        self._lock = threading.RLock()
+        self._freq: defaultdict[int, Counter] = defaultdict(Counter)
+        self._recent: defaultdict[int, deque] = defaultdict(lambda: deque(maxlen=8))
+        self._transitions: defaultdict[tuple[int, int], Counter] = defaultdict(Counter)
+        self._pinned = set(pinned)
+        self._detect_layout()
+        self._expert_bytes = sum(
+            self.index.tensors[self._name(0, proj, suffix)].row_bytes
+            for proj in ("gate", "up", "down")
+            for suffix in ("weight", "scales", "biases")
+            if self._name(0, proj, suffix) in self.index.tensors
+        )
+        self._max_speculative = max(1, budget_bytes // max(1, self._expert_bytes))
+        self.io_window = max(1, min(getattr(index.executor, "_max_workers", 1),
+                                    self._max_speculative))
+
+    def _base(self, layer: int) -> str:
+        return f"model.layers.{layer}.mlp.switch_mlp"
+
+    def _name(self, layer: int, proj: str, suffix: str) -> str:
+        return f"{self._base(layer)}.{proj}_proj.{suffix}"
+
+    def _detect_layout(self) -> None:
+        required = [self._name(0, p, "weight") for p in ("gate", "up", "down")]
+        missing = [x for x in required if x not in self.index.tensors]
+        if missing:
+            raise KeyError(f"streamed expert tensors missing: {missing}")
+        shape = self.index.tensors[required[0]].shape
+        if shape[0] != self.num_experts:
+            raise ValueError(f"expert count {shape[0]} != config {self.num_experts}")
+
+    def _read_linear(self, layer: int, expert: int, proj: str) -> tuple[LinearSlice, int]:
+        weight_name = self._name(layer, proj, "weight")
+        weight = self.index.read_row_numpy(weight_name, expert)
+        nbytes = self.index.tensors[weight_name].row_bytes
+        scales_name = self._name(layer, proj, "scales")
+        biases_name = self._name(layer, proj, "biases")
+        if scales_name not in self.index.tensors:
+            return LinearSlice(weight), nbytes
+        scales = self.index.read_row_numpy(scales_name, expert)
+        biases = self.index.read_row_numpy(biases_name, expert) if biases_name in self.index.tensors else None
+        nbytes += self.index.tensors[scales_name].row_bytes
+        if biases is not None:
+            nbytes += self.index.tensors[biases_name].row_bytes
+        return LinearSlice(weight, scales, biases, self.group_size, self.bits), nbytes
+
+    def _load(self, key: tuple[int, int]) -> ExpertSlice:
+        t0 = time.perf_counter()
+        layer, expert = key
+        gate, ng = self._read_linear(layer, expert, "gate")
+        up, nu = self._read_linear(layer, expert, "up")
+        down, nd = self._read_linear(layer, expert, "down")
+        value = ExpertSlice(gate, up, down, ng + nu + nd)
+        with self._lock:
+            self.stats.loads += 1
+            self.stats.loaded_bytes += value.nbytes
+            self.stats.load_seconds += time.perf_counter() - t0
+        return value
+
+    def request(self, layer: int, expert: int, prefetch: bool = False) -> Future | None:
+        key = (int(layer), int(expert))
+        if self.cache.peek(key) is not None:
+            return None
+        with self._lock:
+            if key in self._futures:
+                return self._futures[key]
+            speculative = sum(k in self._future_prefetch for k in self._futures)
+            if prefetch and speculative >= self._max_speculative:
+                return None
+            future = self.index.executor.submit(self._load, key)
+            self._futures[key] = future
+            if prefetch:
+                self._future_prefetch.add(key)
+                self.stats.prefetch_submitted += 1
+            return future
+
+    def prepare(self, layer: int, experts: Iterable[int]) -> None:
+        for expert in list(experts)[:self.io_window]:
+            self.request(layer, int(expert))
+
+    def get(self, layer: int, expert: int) -> ExpertSlice:
+        key = (int(layer), int(expert))
+        value = self.cache.get(key)
+        if value is not None:
+            return value
+        with self._lock:
+            future = self._futures.get(key)
+        if future is None:
+            future = self.request(*key)
+        assert future is not None
+        value = future.result()
+        for proj, name in ((value.gate, "gate"), (value.up, "up"), (value.down, "down")):
+            proj.weight = _to_mlx(proj.weight, self.index.tensors[self._name(layer, name, "weight")].dtype)
+            if proj.scales is not None:
+                proj.scales = _to_mlx(proj.scales, self.index.tensors[self._name(layer, name, "scales")].dtype)
+            if proj.biases is not None:
+                proj.biases = _to_mlx(proj.biases, self.index.tensors[self._name(layer, name, "biases")].dtype)
+        with self._lock:
+            self._futures.pop(key, None)
+            was_prefetch = key in self._future_prefetch
+            self._future_prefetch.discard(key)
+            if was_prefetch:
+                self.stats.prefetch_hits += 1
+        count = self._freq[layer][expert]
+        self.cache.put(key, value, value.nbytes, pin=key in self._pinned, hot=count >= 4)
+        return value
+
+    def record_route(self, layer: int, experts: Iterable[int]) -> None:
+        selected = tuple(sorted(set(map(int, experts))))
+        with self._lock:
+            previous = self._recent[layer][-1] if self._recent[layer] else ()
+            for old in previous:
+                self._transitions[(layer, old)].update(selected)
+            self._freq[layer].update(selected)
+            self._recent[layer].append(selected)
+            self.stats.routes += len(selected)
+
+    def prefetch_predictions(self, layer: int, selected: Iterable[int]) -> None:
+        if not self.prefetch_count:
+            return
+        candidates = Counter()
+        with self._lock:
+            for expert in selected:
+                candidates.update(self._transitions[(layer, int(expert))])
+            if not candidates:
+                candidates.update(self._freq[layer])
+            if layer + 1 < self.num_layers:
+                candidates.update({e: n * 2 for e, n in self._freq[layer + 1].items()})
+        for expert, _ in candidates.most_common(self.prefetch_count):
+            self.request(layer, expert, prefetch=True)
+        if layer + 1 < self.num_layers:
+            with self._lock:
+                next_ids = self._freq[layer + 1].most_common(self.prefetch_count)
+            for expert, _ in next_ids:
+                self.request(layer + 1, expert, prefetch=True)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            stale = sum(f.done() for f in self._futures.values())
+            out = asdict(self.stats)
+            out["inflight"] = len(self._futures)
+            out["completed_prefetch"] = stale
+        out["cache"] = self.cache.snapshot()
+        return out
+
+    def close(self) -> None:
+        with self._lock:
+            futures = list(self._futures.values())
+            self.stats.prefetch_wasted += len(self._future_prefetch)
+        for future in futures:
+            future.cancel()
+
+
+@dataclass
+class PLERow:
+    weight: mx.array
+    scales: mx.array | None
+    biases: mx.array | None
+    nbytes: int
+
+
+class PLEStore:
+    def __init__(
+        self,
+        index: SafeTensorIndex,
+        budget_bytes: int,
+        layer: int,
+        n_shards: int,
+        rows_per_shard: int,
+        group_size: int = 32,
+        bits: int = 4,
+        policy: str = "adaptive",
+        prefetch: int = 8,
+    ):
+        self.index = index
+        self.cache = ExpertCache(max_bytes=budget_bytes, policy=policy)
+        self.layer = layer
+        self.n_shards = n_shards
+        self.rows_per_shard = rows_per_shard
+        self.group_size = group_size
+        self.bits = bits
+        self.prefetch_count = max(0, prefetch)
+        self.stats = StreamStats()
+        self._futures: dict[tuple[int, int], Future] = {}
+        self._lock = threading.RLock()
+        self._recent: deque[int] = deque(maxlen=256)
+        if self._name(0, "weight") not in index.tensors:
+            raise KeyError(f"streamed PLE tensor missing: {self._name(0, 'weight')}")
+        self._row_bytes = sum(
+            index.tensors[self._name(0, suffix)].row_bytes
+            for suffix in ("weight", "scales", "biases")
+            if self._name(0, suffix) in index.tensors
+        )
+        self._max_speculative = max(1, budget_bytes // max(1, self._row_bytes))
+
+    def _name(self, shard: int, suffix: str) -> str:
+        return (f"model.layers.{self.layer}.ple.ple_embedding.ngram_embedding."
+                f"shard_{shard}.{suffix}")
+
+    def _load_rows(self, shard: int, rows: tuple[int, ...]) -> dict[tuple[int, int], PLERow]:
+        t0 = time.perf_counter()
+        wn = self._name(shard, "weight")
+        sn = self._name(shard, "scales")
+        bn = self._name(shard, "biases")
+        weights = self.index.read_rows_numpy(wn, rows)
+        scales = self.index.read_rows_numpy(sn, rows) if sn in self.index.tensors else None
+        biases = self.index.read_rows_numpy(bn, rows) if bn in self.index.tensors else None
+        row_bytes = self.index.tensors[wn].row_bytes
+        if scales is not None:
+            row_bytes += self.index.tensors[sn].row_bytes
+        if biases is not None:
+            row_bytes += self.index.tensors[bn].row_bytes
+        out = {}
+        for i, row in enumerate(rows):
+            out[(shard, row)] = PLERow(weights[i], None if scales is None else scales[i],
+                                        None if biases is None else biases[i], row_bytes)
+        with self._lock:
+            self.stats.loads += len(rows)
+            self.stats.loaded_bytes += len(rows) * row_bytes
+            self.stats.load_seconds += time.perf_counter() - t0
+        return out
+
+    def _submit_group(self, shard: int, rows: Iterable[int], prefetch: bool) -> None:
+        missing = tuple(sorted(set(int(r) for r in rows if self.cache.peek((shard, int(r))) is None
+                                   and (shard, int(r)) not in self._futures)))
+        if prefetch:
+            slots = self._max_speculative - len(self._futures)
+            missing = missing[:max(0, slots)]
+        if not missing:
+            return
+        group_future = self.index.executor.submit(self._load_rows, shard, missing)
+        for row in missing:
+            child: Future = Future()
+            self._futures[(shard, row)] = child
+        if prefetch:
+            self.stats.prefetch_submitted += len(missing)
+
+        def finish(future):
+            try:
+                values = future.result()
+                for key, value in values.items():
+                    self._futures[key].set_result((value, prefetch))
+            except BaseException as exc:
+                for row in missing:
+                    self._futures[(shard, row)].set_exception(exc)
+        group_future.add_done_callback(finish)
+
+    def get_rows(self, gids: mx.array | np.ndarray) -> mx.array:
+        if isinstance(gids, mx.array):
+            mx.eval(gids)
+            ids = np.asarray(gids).astype(np.int64, copy=False)
+        else:
+            ids = np.asarray(gids, dtype=np.int64)
+        flat = ids.reshape(-1)
+        keys = [(int(g // self.rows_per_shard), int(g % self.rows_per_shard)) for g in flat]
+        if keys and (min(k[0] for k in keys) < 0 or max(k[0] for k in keys) >= self.n_shards):
+            raise IndexError("PLE global row outside sharded table")
+        self.stats.rows_requested += len(keys)
+        self.stats.unique_rows += len(set(keys))
+        groups: defaultdict[int, list[int]] = defaultdict(list)
+        for shard, row in set(keys):
+            if self.cache.peek((shard, row)) is None:
+                groups[shard].append(row)
+        with self._lock:
+            for shard, rows in groups.items():
+                self._submit_group(shard, rows, False)
+        values: dict[tuple[int, int], PLERow] = {}
+        for key in set(keys):
+            value = self.cache.get(key)
+            if value is None:
+                with self._lock:
+                    future = self._futures[key]
+                value, prefetched = future.result()
+                shard, _ = key
+                value.weight = _to_mlx(value.weight, self.index.tensors[self._name(shard, "weight")].dtype)
+                if value.scales is not None:
+                    value.scales = _to_mlx(value.scales, self.index.tensors[self._name(shard, "scales")].dtype)
+                if value.biases is not None:
+                    value.biases = _to_mlx(value.biases, self.index.tensors[self._name(shard, "biases")].dtype)
+                with self._lock:
+                    self._futures.pop(key, None)
+                    if prefetched:
+                        self.stats.prefetch_hits += 1
+                self.cache.put(key, value, value.nbytes)
+            values[key] = value
+        dense = []
+        for key in keys:
+            row = values[key]
+            if row.scales is None:
+                dense.append(row.weight)
+            else:
+                dense.append(mx.dequantize(row.weight[None], row.scales[None],
+                                           None if row.biases is None else row.biases[None],
+                                           group_size=self.group_size, bits=self.bits)[0])
+        if not dense:
+            scales_name = self._name(0, "scales")
+            width = (self.index.tensors[scales_name].shape[-1] * self.group_size
+                     if scales_name in self.index.tensors
+                     else self.index.tensors[self._name(0, "weight")].shape[-1])
+            return mx.zeros((*ids.shape, width), dtype=mx.float32)
+        out = mx.stack(dense).reshape(*ids.shape, -1)
+        self._prefetch_local(keys)
+        return out
+
+    def _prefetch_local(self, keys: list[tuple[int, int]]) -> None:
+        if not self.prefetch_count or not keys:
+            return
+        groups: defaultdict[int, list[int]] = defaultdict(list)
+        for shard, row in keys[-self.prefetch_count:]:
+            if row + 1 < self.rows_per_shard:
+                groups[shard].append(row + 1)
+        with self._lock:
+            for shard, rows in groups.items():
+                self._submit_group(shard, rows, True)
+
+    def snapshot(self) -> dict:
+        out = asdict(self.stats)
+        out["inflight"] = len(self._futures)
+        out["cache"] = self.cache.snapshot()
+        return out
+
+    def close(self) -> None:
+        with self._lock:
+            self.stats.prefetch_wasted += len(self._futures)
+            futures = list(self._futures.values())
+        for future in futures:
+            future.cancel()
