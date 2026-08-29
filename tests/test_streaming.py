@@ -102,6 +102,19 @@ def test_expert_batch_coalesces_contiguous_reads(tmp_path):
     index.close()
 
 
+def test_route_frequency_counts_token_assignments(tmp_path):
+    tiny_file(tmp_path)
+    index = SafeTensorIndex(tmp_path)
+    store = ExpertStore(index, budget_bytes=4096, num_layers=1, num_experts=4,
+                        group_size=32, bits=4, prefetch=0)
+    store.record_route(0, [1, 1, 2])
+    snapshot = store.snapshot()
+    assert snapshot["routes"] == 3
+    assert snapshot["frequent_experts"][0] == {"layer": 0, "expert": 1, "count": 2}
+    store.close()
+    index.close()
+
+
 def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
     _, ple = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)

@@ -240,14 +240,15 @@ class ExpertStore:
         return value
 
     def record_route(self, layer: int, experts: Iterable[int]) -> None:
-        selected = tuple(sorted(set(map(int, experts))))
+        routed = tuple(map(int, experts))
+        selected = tuple(sorted(set(routed)))
         with self._lock:
             previous = self._recent[layer][-1] if self._recent[layer] else ()
             for old in previous:
                 self._transitions[(layer, old)].update(selected)
-            self._freq[layer].update(selected)
+            self._freq[layer].update(routed)
             self._recent[layer].append(selected)
-            self.stats.routes += len(selected)
+            self.stats.routes += len(routed)
 
     def prefetch_predictions(self, layer: int, selected: Iterable[int]) -> None:
         if not self.prefetch_count:

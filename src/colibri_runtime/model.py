@@ -325,7 +325,7 @@ class StreamedSparseMoeBlock(nn.Module):
             slots = mx.put_along_axis(slots, mx.array(positions)[:, None], result, axis=0)
         routed = slots.reshape(flat_x.shape[0], self.top_k, -1)
         routed = (routed * weights.reshape(-1, self.top_k)[..., None]).sum(1).reshape(x.shape)
-        self.store.record_route(self.layer_idx, unique.tolist())
+        self.store.record_route(self.layer_idx, idx_np.reshape(-1).tolist())
         self.store.prefetch_predictions(self.layer_idx, unique.tolist())
         return routed + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
 
