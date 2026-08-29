@@ -47,6 +47,7 @@ def test_header_and_exact_row_ranges(tmp_path):
     index = SafeTensorIndex(tmp_path)
     name = "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
     info = index.tensors[name]
+    assert len(index._fds) == 1
     rows = index.read_rows(name, [1, 2, 5])
     assert rows.shape == (3, info.shape[1])
     stats = index.snapshot()

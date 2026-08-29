@@ -93,8 +93,11 @@ class SafeTensorIndex:
                 if name in self.tensors:
                     raise ValueError(f"duplicate tensor {name}")
                 self.tensors[name] = TensorInfo(name, path, dtype, shape, base + lo, hi - lo)
-        finally:
+        except BaseException:
             os.close(fd)
+            raise
+        with self._lock:
+            self._fds[path] = fd
 
     def _fd(self, path: Path) -> int:
         with self._lock:
