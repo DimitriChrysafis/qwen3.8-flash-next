@@ -19,6 +19,8 @@ def _parser():
     parser.add_argument("--model", required=True)
     parser.add_argument("--expert-budget-gib", type=float, default=8.0)
     parser.add_argument("--ple-budget-gib", type=float, default=1.0)
+    parser.add_argument("--mlx-cache-gib", type=float, default=1.0)
+    parser.add_argument("--mlx-memory-gib", type=float, default=28.0)
     parser.add_argument("--cache-policy", choices=["lru", "lfu", "adaptive"], default="adaptive")
     parser.add_argument("--io-workers", type=int, default=6)
     parser.add_argument("--expert-prefetch", type=int, default=2)
@@ -40,6 +42,8 @@ def _parser():
 
 def main(argv=None):
     args = _parser().parse_args(argv)
+    mx.set_cache_limit(_bytes_gib(args.mlx_cache_gib))
+    mx.set_memory_limit(_bytes_gib(args.mlx_memory_gib))
     mx.reset_peak_memory()
     sampler = MemorySampler()
     model = None
