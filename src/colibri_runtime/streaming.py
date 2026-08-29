@@ -233,9 +233,12 @@ class ExpertStore:
             out = asdict(self.stats)
             out["inflight"] = len(self._futures)
             out["completed_prefetch"] = stale
-            out["frequent_experts"] = {
-                str(layer): counts.most_common(5) for layer, counts in self._freq.items()
-            }
+            frequent = Counter({(layer, expert): count for layer, counts in self._freq.items()
+                                for expert, count in counts.items()})
+            out["frequent_experts"] = [
+                {"layer": layer, "expert": expert, "count": count}
+                for (layer, expert), count in frequent.most_common(20)
+            ]
         out["cache"] = self.cache.snapshot()
         return out
 
@@ -341,6 +344,24 @@ class PLEStore:
                     self._futures[(shard, row)].set_exception(exc)
         group_future.add_done_callback(finish)
 
+    def prefetch_rows(self, gids: mx.array | np.ndarray) -> None:
+        if not self.prefetch_count:
+            return
+        if isinstance(gids, mx.array):
+            mx.eval(gids)
+            ids = np.asarray(gids).astype(np.int64, copy=False)
+        else:
+            ids = np.asarray(gids, dtype=np.int64)
+        groups: defaultdict[int, list[int]] = defaultdict(list)
+        for gid in set(ids.reshape(-1).tolist()):
+            shard, row = divmod(int(gid), self.rows_per_shard)
+            if shard < 0 or shard >= self.n_shards:
+                raise IndexError("PLE global row outside sharded table")
+            groups[shard].append(row)
+        with self._lock:
+            for shard, rows in groups.items():
+                self._submit_group(shard, rows, True)
+
     def get_rows(self, gids: mx.array | np.ndarray) -> mx.array:
         if isinstance(gids, mx.array):
             mx.eval(gids)
@@ -398,20 +419,7 @@ class PLEStore:
                      if scales_name in self.index.tensors
                      else self.index.tensors[self._name(0, "weight")].shape[-1])
             return mx.zeros((*ids.shape, width), dtype=mx.float32)
-        out = mx.stack(dense).reshape(*ids.shape, -1)
-        self._prefetch_local(keys)
-        return out
-
-    def _prefetch_local(self, keys: list[tuple[int, int]]) -> None:
-        if not self.prefetch_count or not keys:
-            return
-        groups: defaultdict[int, list[int]] = defaultdict(list)
-        for shard, row in keys[-self.prefetch_count:]:
-            if row + 1 < self.rows_per_shard:
-                groups[shard].append(row + 1)
-        with self._lock:
-            for shard, rows in groups.items():
-                self._submit_group(shard, rows, True)
+        return mx.stack(dense).reshape(*ids.shape, -1)
 
     def snapshot(self) -> dict:
         out = asdict(self.stats)

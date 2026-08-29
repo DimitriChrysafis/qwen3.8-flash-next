@@ -408,7 +408,7 @@ class StreamedNGramEmbedding(nn.Module):
         gathered = mx.take_along_axis(ids, mx.broadcast_to(mx.maximum(src, 0)[None], (bsz, seq)), 1)
         return mx.where((pos[None] - (prev + 1) >= shift) & (src[None] >= 0), gathered, self.eos_token_id)
 
-    def __call__(self, ids, prev_context):
+    def indices(self, ids, prev_context):
         n_new = ids.shape[1]
         history = mx.concatenate([prev_context, ids], 1).astype(mx.int64)
         shifted = [self._shift_right(history, s) for s in range(self.ngram_size)]
@@ -421,7 +421,13 @@ class StreamedNGramEmbedding(nn.Module):
                 mixed = mx.bitwise_xor(mixed, shifted[p] * self.layer_multipliers[p])
             gid = mixed[..., None] % self.ngram_heads_vocab_sizes[lo:hi].reshape(1, 1, -1)
             blocks.append(gid + self.ngram_heads_offsets[lo:hi].reshape(1, 1, -1))
-        gid = mx.concatenate(blocks, -1)[:, -n_new:]
+        return mx.concatenate(blocks, -1)[:, -n_new:]
+
+    def prefetch(self, ids, prev_context):
+        self.store.prefetch_rows(self.indices(ids, prev_context))
+
+    def __call__(self, ids, prev_context):
+        gid = self.indices(ids, prev_context)
         return self.store.get_rows(gid).reshape(*gid.shape[:2], -1)
 
 
@@ -505,6 +511,7 @@ class Qwen4ExpModel(nn.Module):
             prev = pc[3] if pc is not None else None
             prev_ctx = prev if prev is not None else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             if pc is not None: pc[3] = mx.concatenate([prev_ctx, ids], 1)[:, -ctx_len:]
+            self.layers[self.ple_layers[0]].ple.ple_embedding.prefetch(ids, prev_ctx)
         h = mx.tile(h, (1, 1, self.hc))
         for layer, state in zip(self.layers, cache):
             idx_cache = state.indexer if state is not None and hasattr(state, "indexer") else None

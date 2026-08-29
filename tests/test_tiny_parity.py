@@ -88,12 +88,12 @@ def test_full_streamed_tiny_model_matches_transformers(tmp_path):
     with torch.no_grad():
         expected = reference(ids).logits.float().numpy()
     actual = as_numpy(streamed(mx.array(ids.numpy())))
-    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+    assert np.max(np.abs(actual - expected)) < 5e-7
 
     cache = streamed.make_cache()
     pieces = [as_numpy(streamed(mx.array(ids[:, i:i + 1].numpy()), cache=cache))
               for i in range(ids.shape[1])]
-    np.testing.assert_allclose(np.concatenate(pieces, axis=1), actual, rtol=2e-4, atol=2e-4)
+    assert np.max(np.abs(np.concatenate(pieces, axis=1) - actual)) < 5e-7
 
     cache = streamed.make_cache()
     chunked = np.concatenate([

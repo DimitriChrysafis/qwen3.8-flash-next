@@ -56,7 +56,7 @@ def load_model(
             if _is_streamed(name) or name.startswith("vision_tower.") or name.startswith("model.visual."):
                 continue
             weights[name] = value
-            info = index.tensors.get(name)
+            info = index.tensors.get(name.removeprefix("language_model."))
             if info is not None:
                 lazy_bytes += info.nbytes
     weights = model.sanitize(weights)

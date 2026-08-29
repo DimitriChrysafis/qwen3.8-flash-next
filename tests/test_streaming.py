@@ -91,8 +91,9 @@ def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
     row_bytes = sum(index.tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.{s}"].row_bytes
                     for s in ("weight", "scales", "biases"))
     store = PLEStore(index, row_bytes * 4, layer=0, n_shards=2, rows_per_shard=8,
-                     group_size=32, bits=4, prefetch=0)
+                     group_size=32, bits=4, prefetch=8)
     gids = mx.array([[1, 9, 1, 7]])
+    store.prefetch_rows(gids)
     out = np.array(store.get_rows(gids))
     expected = []
     for gid in [1, 9, 1, 7]:
@@ -103,6 +104,8 @@ def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
     assert snap["rows_requested"] == 4
     assert snap["unique_rows"] == 3
     assert snap["loaded_bytes"] == 3 * row_bytes
+    assert snap["prefetch_submitted"] == 3
+    assert snap["prefetch_hits"] == 3
     assert snap["cache"]["bytes"] <= 4 * row_bytes
     index.close()
 

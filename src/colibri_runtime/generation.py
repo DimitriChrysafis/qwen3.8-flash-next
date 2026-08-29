@@ -13,6 +13,7 @@ import psutil
 class GenerationMetrics:
     prompt_tokens: int
     generated_tokens: int
+    decode_tokens: int
     load_seconds: float
     prefill_seconds: float
     generation_seconds: float
@@ -85,7 +86,7 @@ def generate_tokens(model, input_ids, max_tokens=64, temperature=0.0, top_p=1.0,
     prefill_done = time.perf_counter()
     generated = []
     first_at = None
-    for _ in range(max_tokens):
+    for step in range(max_tokens):
         token = _sample(logits[:, -1].astype(mx.float32), temperature, top_p)
         mx.eval(token)
         if first_at is None:
@@ -98,8 +99,9 @@ def generate_tokens(model, input_ids, max_tokens=64, temperature=0.0, top_p=1.0,
             eos = set(eos_token_id if isinstance(eos_token_id, list) else [eos_token_id])
             if value in eos:
                 break
-        logits = model(token[:, None], cache=cache)
-        mx.eval(logits)
+        if step + 1 < max_tokens:
+            logits = model(token[:, None], cache=cache)
+            mx.eval(logits)
     done = time.perf_counter()
     return generated, {
         "started": t0,
@@ -111,19 +113,21 @@ def generate_tokens(model, input_ids, max_tokens=64, temperature=0.0, top_p=1.0,
 
 def metrics(model, prompt_tokens, generated_tokens, timing, load_seconds=0.0, memory=None):
     prefill = timing["prefill_done"] - timing["started"]
-    generation = timing["done"] - timing["prefill_done"]
+    generation = timing["done"] - timing["first_token"]
+    decode_tokens = max(0, generated_tokens - 1)
     process = psutil.Process()
     memory = memory or {"average_rss_bytes": process.memory_info().rss,
                         "peak_rss_bytes": process.memory_info().rss}
     result = GenerationMetrics(
         prompt_tokens=prompt_tokens,
         generated_tokens=generated_tokens,
+        decode_tokens=decode_tokens,
         load_seconds=load_seconds,
         prefill_seconds=prefill,
         generation_seconds=generation,
         ttft_seconds=timing["first_token"] - timing["started"],
         prompt_tokens_per_second=prompt_tokens / prefill if prefill else 0.0,
-        generation_tokens_per_second=generated_tokens / generation if generation else 0.0,
+        generation_tokens_per_second=decode_tokens / generation if generation else 0.0,
         rss_bytes=process.memory_info().rss,
         average_rss_bytes=memory["average_rss_bytes"],
         peak_rss_bytes=memory["peak_rss_bytes"],

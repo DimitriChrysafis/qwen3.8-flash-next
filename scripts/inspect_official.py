@@ -34,7 +34,7 @@ def main() -> None:
         "tokenizer_chat_template": tok_cfg.get("chat_template", "")[:180],
         "default_generation": gen_cfg,
     }
-    out = Path("/Users/dofa/Documents/github/qwen3.8-flash-next/artifacts/official_summary.json")
+    out = Path(__file__).resolve().parents[1] / "artifacts/official_summary.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, indent=2))
     print(json.dumps(summary, indent=2))
