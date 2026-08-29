@@ -29,7 +29,7 @@ def _delta(after, before):
             key: value - before[group].get(key, 0)
             for key, value in after[group].items()
             if isinstance(value, (int, float)) and not isinstance(value, bool)
-            and key not in {"inflight", "completed_prefetch"}
+            and key not in {"inflight", "completed_prefetch", "ready_prefetch", "prefetch_limit"}
         }
         if "cache" in after[group]:
             out[group]["cache"] = {

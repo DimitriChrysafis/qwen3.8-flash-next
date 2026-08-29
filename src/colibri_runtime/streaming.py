@@ -87,6 +87,7 @@ class ExpertStore:
         self.stats = StreamStats()
         self._futures: dict[tuple[int, int], Future] = {}
         self._future_prefetch: set[tuple[int, int]] = set()
+        self._prefetched_ready: set[tuple[int, int]] = set()
         self._lock = threading.RLock()
         self._freq: defaultdict[int, Counter] = defaultdict(Counter)
         self._recent: defaultdict[int, deque] = defaultdict(lambda: deque(maxlen=8))
@@ -99,9 +100,10 @@ class ExpertStore:
             for suffix in ("weight", "scales", "biases")
             if self._name(0, proj, suffix) in self.index.tensors
         )
-        self._max_speculative = max(1, budget_bytes // max(1, self._expert_bytes))
-        self.io_window = max(1, min(getattr(index.executor, "_max_workers", 1),
-                                    self._max_speculative))
+        cache_slots = max(1, budget_bytes // max(1, self._expert_bytes))
+        workers = getattr(index.executor, "_max_workers", 1)
+        self._max_speculative = min(cache_slots, max(workers * 2, self.prefetch_count * num_layers))
+        self.io_window = max(1, min(workers, cache_slots))
 
     def _base(self, layer: int) -> str:
         return f"model.layers.{layer}.mlp.switch_mlp"
@@ -204,14 +206,56 @@ class ExpertStore:
             return self._futures.get(key)
 
     def prepare(self, layer: int, experts: Iterable[int]) -> None:
+        self._harvest_prefetches()
         experts = list(dict.fromkeys(map(int, experts)))
         for start in range(0, len(experts), 32):
             self.request_many(layer, experts[start:start + 32])
+
+    def _materialize(self, layer: int, value: ExpertSlice) -> ExpertSlice:
+        for proj, name in ((value.gate, "gate"), (value.up, "up"), (value.down, "down")):
+            proj.weight = _to_mlx(proj.weight, self.index.tensors[self._name(layer, name, "weight")].dtype)
+            if proj.scales is not None:
+                proj.scales = _to_mlx(proj.scales, self.index.tensors[self._name(layer, name, "scales")].dtype)
+            if proj.biases is not None:
+                proj.biases = _to_mlx(proj.biases, self.index.tensors[self._name(layer, name, "biases")].dtype)
+        return value
+
+    def _harvest_prefetches(self) -> None:
+        with self._lock:
+            completed = [(key, self._futures[key]) for key in self._future_prefetch
+                         if self._futures[key].done()]
+        for key, future in completed:
+            layer, expert = key
+            try:
+                value = self._materialize(layer, future.result())
+            except BaseException:
+                with self._lock:
+                    self._futures.pop(key, None)
+                    self._future_prefetch.discard(key)
+                    self.stats.prefetch_wasted += 1
+                continue
+            inserted = self.cache.put(key, value, value.nbytes, pin=key in self._pinned,
+                                      hot=self._freq[layer][expert] >= 4)
+            with self._lock:
+                self._futures.pop(key, None)
+                self._future_prefetch.discard(key)
+                if inserted:
+                    self._prefetched_ready.add(key)
+                else:
+                    self.stats.prefetch_wasted += 1
+        with self._lock:
+            stale = [key for key in self._prefetched_ready if self.cache.peek(key) is None]
+            self._prefetched_ready.difference_update(stale)
+            self.stats.prefetch_wasted += len(stale)
 
     def get(self, layer: int, expert: int) -> ExpertSlice:
         key = (int(layer), int(expert))
         value = self.cache.get(key)
         if value is not None:
+            with self._lock:
+                if key in self._prefetched_ready:
+                    self._prefetched_ready.discard(key)
+                    self.stats.prefetch_hits += 1
             return value
         with self._lock:
             future = self._futures.get(key)
@@ -223,12 +267,7 @@ class ExpertStore:
         waited = time.perf_counter() - wait_started
         with self._lock:
             self.stats.wait_seconds += waited
-        for proj, name in ((value.gate, "gate"), (value.up, "up"), (value.down, "down")):
-            proj.weight = _to_mlx(proj.weight, self.index.tensors[self._name(layer, name, "weight")].dtype)
-            if proj.scales is not None:
-                proj.scales = _to_mlx(proj.scales, self.index.tensors[self._name(layer, name, "scales")].dtype)
-            if proj.biases is not None:
-                proj.biases = _to_mlx(proj.biases, self.index.tensors[self._name(layer, name, "biases")].dtype)
+        value = self._materialize(layer, value)
         with self._lock:
             self._futures.pop(key, None)
             was_prefetch = key in self._future_prefetch
@@ -277,6 +316,8 @@ class ExpertStore:
             out = asdict(self.stats)
             out["inflight"] = len(self._futures)
             out["completed_prefetch"] = stale
+            out["ready_prefetch"] = len(self._prefetched_ready)
+            out["prefetch_limit"] = self._max_speculative
             frequent = Counter({(layer, expert): count for layer, counts in self._freq.items()
                                 for expert, count in counts.items()})
             out["frequent_experts"] = [
@@ -289,7 +330,7 @@ class ExpertStore:
     def close(self) -> None:
         with self._lock:
             futures = list(self._futures.values())
-            self.stats.prefetch_wasted += len(self._future_prefetch)
+            self.stats.prefetch_wasted += len(self._future_prefetch) + len(self._prefetched_ready)
         for future in futures:
             future.cancel()
 

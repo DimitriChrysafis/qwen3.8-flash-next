@@ -66,7 +66,10 @@ def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
                     for p in ("gate", "up", "down") for suffix in ("weight", "scales", "biases"))
     store = ExpertStore(index, budget_bytes=one_bytes * 2, num_layers=1, num_experts=4,
                         group_size=32, bits=4, prefetch=2)
-    store.request(0, 2, prefetch=True)
+    future = store.request(0, 2, prefetch=True)
+    future.result()
+    store.prepare(0, [])
+    assert store.snapshot()["ready_prefetch"] == 1
     expert = store.get(0, 2)
     x = mx.array(np.random.default_rng(2).normal(size=(3, 32)).astype(np.float32))
     out = np.array(expert(x))
