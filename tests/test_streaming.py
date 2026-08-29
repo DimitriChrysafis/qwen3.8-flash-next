@@ -78,6 +78,7 @@ def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
     np.testing.assert_allclose(out, np.array(expected), rtol=1e-5, atol=1e-5)
     assert store.snapshot()["prefetch_hits"] == 1
     assert store.snapshot()["loaded_bytes"] == one_bytes
+    assert store.snapshot()["wait_seconds"] >= 0
     store.get(0, 0); store.get(0, 1)
     assert store.cache.snapshot()["bytes"] <= one_bytes * 2
     assert store.cache.snapshot()["evictions"] >= 1

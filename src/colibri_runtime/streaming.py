@@ -28,6 +28,7 @@ def _to_mlx(value, dtype_name: str):
 class StreamStats:
     loads: int = 0
     load_seconds: float = 0.0
+    wait_seconds: float = 0.0
     loaded_bytes: int = 0
     prefetch_submitted: int = 0
     prefetch_hits: int = 0
@@ -176,7 +177,11 @@ class ExpertStore:
         if future is None:
             future = self.request(*key)
         assert future is not None
+        wait_started = time.perf_counter()
         value = future.result()
+        waited = time.perf_counter() - wait_started
+        with self._lock:
+            self.stats.wait_seconds += waited
         for proj, name in ((value.gate, "gate"), (value.up, "up"), (value.down, "down")):
             proj.weight = _to_mlx(proj.weight, self.index.tensors[self._name(layer, name, "weight")].dtype)
             if proj.scales is not None:
@@ -228,6 +233,9 @@ class ExpertStore:
             out = asdict(self.stats)
             out["inflight"] = len(self._futures)
             out["completed_prefetch"] = stale
+            out["frequent_experts"] = {
+                str(layer): counts.most_common(5) for layer, counts in self._freq.items()
+            }
         out["cache"] = self.cache.snapshot()
         return out
 
@@ -358,7 +366,11 @@ class PLEStore:
             if value is None:
                 with self._lock:
                     future = self._futures[key]
+                wait_started = time.perf_counter()
                 value, prefetched = future.result()
+                waited = time.perf_counter() - wait_started
+                with self._lock:
+                    self.stats.wait_seconds += waited
                 shard, _ = key
                 value.weight = _to_mlx(value.weight, self.index.tensors[self._name(shard, "weight")].dtype)
                 if value.scales is not None:
