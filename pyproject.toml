@@ -10,6 +10,9 @@ dependencies = [
   "safetensors>=0.4",
 ]
 
+[project.optional-dependencies]
+validation = ["torch==2.13.0", "transformers==5.16.1"]
+
 [project.scripts]
 colibri-qwen = "colibri_runtime.cli:main"
 
