@@ -489,22 +489,23 @@ class PLEStore:
                         self.stats.prefetch_hits += 1
                 self.cache.put(key, value, value.nbytes)
             values[key] = value
-        dense = []
-        for key in keys:
-            row = values[key]
-            if row.scales is None:
-                dense.append(row.weight)
-            else:
-                dense.append(mx.dequantize(row.weight[None], row.scales[None],
-                                           None if row.biases is None else row.biases[None],
-                                           group_size=self.group_size, bits=self.bits)[0])
-        if not dense:
+        if not keys:
             scales_name = self._name(0, "scales")
             width = (self.index.tensors[scales_name].shape[-1] * self.group_size
                      if scales_name in self.index.tensors
                      else self.index.tensors[self._name(0, "weight")].shape[-1])
             return mx.zeros((*ids.shape, width), dtype=mx.float32)
-        return mx.stack(dense).reshape(*ids.shape, -1)
+        unique = list(values)
+        rows = [values[key] for key in unique]
+        weights = mx.stack([row.weight for row in rows])
+        if rows[0].scales is not None:
+            scales = mx.stack([row.scales for row in rows])
+            biases = None if rows[0].biases is None else mx.stack([row.biases for row in rows])
+            weights = mx.dequantize(weights, scales, biases,
+                                    group_size=self.group_size, bits=self.bits)
+        lookup = {key: i for i, key in enumerate(unique)}
+        positions = mx.array([lookup[key] for key in keys])
+        return mx.take(weights, positions, axis=0).reshape(*ids.shape, -1)
 
     def snapshot(self) -> dict:
         out = asdict(self.stats)
