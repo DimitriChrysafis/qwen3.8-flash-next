@@ -6,7 +6,7 @@ import time
 
 import mlx.core as mx
 
-from .generation import generate_tokens, metrics
+from .generation import MemorySampler, generate_tokens, metrics
 from .load import load
 
 
@@ -41,37 +41,52 @@ def _parser():
 def main(argv=None):
     args = _parser().parse_args(argv)
     mx.reset_peak_memory()
-    t0 = time.perf_counter()
-    model, tokenizer = load(
-        args.model,
-        expert_budget_bytes=_bytes_gib(args.expert_budget_gib),
-        ple_budget_bytes=_bytes_gib(args.ple_budget_gib),
-        cache_policy=args.cache_policy,
-        io_workers=args.io_workers,
-        prefetch_experts=args.expert_prefetch,
-        prefetch_ple=args.ple_prefetch,
-    )
-    loaded = time.perf_counter() - t0
-    ids = tokenizer.encode(args.prompt)
-    eos = model.args.text.eos_token_id
-    if args.command == "generate":
-        decoder = tokenizer.decode
-        generated, timing = generate_tokens(
-            model, ids, args.max_tokens, args.temperature, args.top_p, eos, args.seed,
-            on_token=lambda token: print(decoder([token]), end="", flush=True),
+    sampler = MemorySampler()
+    model = None
+    try:
+        t0 = time.perf_counter()
+        model, tokenizer = load(
+            args.model,
+            expert_budget_bytes=_bytes_gib(args.expert_budget_gib),
+            ple_budget_bytes=_bytes_gib(args.ple_budget_gib),
+            cache_policy=args.cache_policy,
+            io_workers=args.io_workers,
+            prefetch_experts=args.expert_prefetch,
+            prefetch_ple=args.ple_prefetch,
         )
-        print()
-        print(json.dumps(metrics(model, len(ids), len(generated), timing, loaded), indent=2))
-    else:
-        reports = []
-        for run in range(args.runs):
-            generated, timing = generate_tokens(model, ids, args.max_tokens, 0.0, 1.0, eos, run)
-            reports.append(metrics(model, len(ids), len(generated), timing, loaded if run == 0 else 0.0))
-        print(json.dumps(reports if args.runs > 1 else reports[0], indent=2))
-    model.expert_store.close()
-    model.ple_store.close()
-    model.expert_store.index.close()
-    return 0
+        loaded = time.perf_counter() - t0
+        load_memory = sampler.snapshot()
+        ids = tokenizer.encode(args.prompt)
+        eos = model.args.text.eos_token_id
+        if args.command == "generate":
+            sampler.reset()
+            decoder = tokenizer.decode
+            generated, timing = generate_tokens(
+                model, ids, args.max_tokens, args.temperature, args.top_p, eos, args.seed,
+                on_token=lambda token: print(decoder([token]), end="", flush=True),
+            )
+            print()
+            report = metrics(model, len(ids), len(generated), timing, loaded, sampler.snapshot())
+            report["load_memory"] = load_memory
+            print(json.dumps(report, indent=2))
+        else:
+            reports = []
+            for run in range(args.runs):
+                sampler.reset()
+                generated, timing = generate_tokens(model, ids, args.max_tokens, 0.0, 1.0, eos, run)
+                report = metrics(model, len(ids), len(generated), timing,
+                                 loaded if run == 0 else 0.0, sampler.snapshot())
+                if run == 0:
+                    report["load_memory"] = load_memory
+                reports.append(report)
+            print(json.dumps(reports if args.runs > 1 else reports[0], indent=2))
+        return 0
+    finally:
+        sampler.close()
+        if model is not None:
+            model.expert_store.close()
+            model.ple_store.close()
+            model.expert_store.index.close()
 
 
 if __name__ == "__main__":

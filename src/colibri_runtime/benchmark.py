@@ -1,29 +1,39 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 
-def run_streaming(cmd: list[str]) -> tuple[int, str, str, float, float | None]:
+def run_streaming(cmd: list[str], prompt: str) -> tuple[int, str, str, float, float | None]:
     t0 = time.time()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    assert p.stdout is not None
+    assert p.stdout is not None and p.stderr is not None
     chunks: list[str] = []
+    errors: list[str] = []
+    drain = threading.Thread(target=lambda: errors.extend(iter(p.stderr.readline, "")), daemon=True)
+    drain.start()
     first_token_at: float | None = None
+    marker = f"> {prompt}"
+    armed = False
     while True:
         ch = p.stdout.read(1)
         if ch == "" and p.poll() is not None:
             break
-        if ch:
-            chunks.append(ch)
-            if first_token_at is None and not ch.isspace():
-                first_token_at = time.time()
-    se = p.stderr.read() if p.stderr is not None else ""
+        if not ch:
+            continue
+        chunks.append(ch)
+        if not armed and marker in "".join(chunks[-len(marker) - 2:]):
+            armed = True
+        elif armed and first_token_at is None and not ch.isspace():
+            first_token_at = time.time()
     rc = p.wait()
-    return rc, "".join(chunks), se, time.time() - t0, (first_token_at - t0) if first_token_at else None
+    drain.join()
+    return rc, "".join(chunks), "".join(errors), time.time() - t0, (first_token_at - t0) if first_token_at else None
 
 
 def parse_llama_timings(text: str) -> dict[str, float]:
@@ -40,12 +50,20 @@ def parse_llama_timings(text: str) -> dict[str, float]:
             if k == "load_s":
                 v = v / 1000.0
             out[k] = v
+    summary = re.search(r"\[ Prompt: ([\d.]+) t/s \| Generation: ([\d.]+) t/s \]", text)
+    if summary:
+        out["prompt_tps"] = float(summary.group(1))
+        out["gen_tps"] = float(summary.group(2))
     return out
 
 
 def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, ngl: str) -> dict:
+    executable = os.environ.get(
+        "COLIBRI_LLAMA_CLI",
+        str(Path.home() / "qwen3.8next/llama.cpp/build/bin/llama-cli"),
+    )
     cmd = [
-        "llama-cli",
+        executable,
         "-m",
         model,
         "-p",
@@ -58,16 +76,27 @@ def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, n
         str(threads),
         "-tb",
         str(threads),
+        "-b",
+        "32",
+        "-ub",
+        "32",
         "--temp",
         "0",
         "--no-display-prompt",
         "--simple-io",
+        "--single-turn",
+        "--no-warmup",
+        "--perf",
         "--cpu-moe",
         "--gpu-layers",
         ngl,
+        "-ot",
+        "per_layer_token_embd=CPU",
+        "--fit",
+        "off",
     ]
     timed_cmd = ["/usr/bin/time", "-l", *cmd]
-    rc, so, se, wall, ttft = run_streaming(timed_cmd)
+    rc, so, se, wall, ttft = run_streaming(timed_cmd, prompt)
     parsed = parse_llama_timings(so + "\n" + se)
     rss = None
     m = re.search(r"(\d+)\s+maximum resident set size", se)

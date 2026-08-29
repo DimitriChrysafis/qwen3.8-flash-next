@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import asdict, dataclass
 
@@ -19,9 +20,41 @@ class GenerationMetrics:
     prompt_tokens_per_second: float
     generation_tokens_per_second: float
     rss_bytes: int
+    average_rss_bytes: int
+    peak_rss_bytes: int
     peak_mlx_bytes: int
     active_mlx_bytes: int
     cache_mlx_bytes: int
+
+
+class MemorySampler:
+    def __init__(self, interval: float = 0.05):
+        self.interval = interval
+        self.process = psutil.Process()
+        self.samples: list[int] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self.samples.append(self.process.memory_info().rss)
+
+    def reset(self):
+        self.samples.clear()
+        self.samples.append(self.process.memory_info().rss)
+
+    def snapshot(self):
+        samples = self.samples or [self.process.memory_info().rss]
+        return {
+            "average_rss_bytes": int(sum(samples) / len(samples)),
+            "peak_rss_bytes": max(samples),
+            "rss_samples": len(samples),
+        }
+
+    def close(self):
+        self._stop.set()
+        self._thread.join()
 
 
 def _sample(logits, temperature: float, top_p: float):
@@ -76,10 +109,12 @@ def generate_tokens(model, input_ids, max_tokens=64, temperature=0.0, top_p=1.0,
     }
 
 
-def metrics(model, prompt_tokens, generated_tokens, timing, load_seconds=0.0):
+def metrics(model, prompt_tokens, generated_tokens, timing, load_seconds=0.0, memory=None):
     prefill = timing["prefill_done"] - timing["started"]
     generation = timing["done"] - timing["prefill_done"]
     process = psutil.Process()
+    memory = memory or {"average_rss_bytes": process.memory_info().rss,
+                        "peak_rss_bytes": process.memory_info().rss}
     result = GenerationMetrics(
         prompt_tokens=prompt_tokens,
         generated_tokens=generated_tokens,
@@ -90,6 +125,8 @@ def metrics(model, prompt_tokens, generated_tokens, timing, load_seconds=0.0):
         prompt_tokens_per_second=prompt_tokens / prefill if prefill else 0.0,
         generation_tokens_per_second=generated_tokens / generation if generation else 0.0,
         rss_bytes=process.memory_info().rss,
+        average_rss_bytes=memory["average_rss_bytes"],
+        peak_rss_bytes=memory["peak_rss_bytes"],
         peak_mlx_bytes=mx.get_peak_memory(),
         active_mlx_bytes=mx.get_active_memory(),
         cache_mlx_bytes=mx.get_cache_memory(),
@@ -99,4 +136,11 @@ def metrics(model, prompt_tokens, generated_tokens, timing, load_seconds=0.0):
     out["ple"] = model.ple_store.snapshot()
     out["disk"] = model.expert_store.index.snapshot()
     out["load"] = model.load_stats
+    read_seconds = out["disk"]["read_seconds"]
+    out["disk"]["effective_bytes_per_second"] = (
+        out["disk"]["bytes_read"] / read_seconds if read_seconds else 0.0
+    )
+    for stream in (out["expert"], out["ple"]):
+        submitted = stream["prefetch_submitted"]
+        stream["prefetch_hit_rate"] = stream["prefetch_hits"] / submitted if submitted else 0.0
     return out

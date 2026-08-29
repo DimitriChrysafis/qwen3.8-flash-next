@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import subprocess
 from pathlib import Path
 
 from colibri_runtime.benchmark import benchmark, write_json
 
-MODEL = str(Path.home() / "qwen3.8next/models/bartowski-Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-IQ1_S-00001-of-00002.gguf")
+MODEL = str(Path.home() / "qwen3.8next/models/bartowski-Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-IQ1_S/Qwen3.8-Flash-Next-IQ1_S-00001-of-00002.gguf")
 
 
 def sys_snapshot() -> dict:
@@ -23,7 +24,8 @@ def main() -> None:
         "model": MODEL,
         "runs": {},
     }
-    warmup = benchmark(MODEL, "Reply with the single word: warm", 16, 4096, 12, "1")
+    generated = int(os.environ.get("COLIBRI_BENCH_TOKENS", "8"))
+    warmup = benchmark(MODEL, "Reply with the single word: warm", 1, 512, 12, "0")
     out["runs"]["warmup"] = warmup
 
     prompts = {
@@ -33,7 +35,7 @@ def main() -> None:
                 " Also include caveats for quantized sparse MoE models and fallback strategies when a full checkpoint cannot fit.",
     }
     for k, p in prompts.items():
-        out["runs"][k] = benchmark(MODEL, p, 128, 8192, 12, "1")
+        out["runs"][k] = benchmark(MODEL, p, generated, 512, 12, "0")
 
     write_json("/Users/dofa/Documents/github/qwen3.8-flash-next/artifacts/benchmark_results.json", out)
     print(json.dumps(out, indent=2))
