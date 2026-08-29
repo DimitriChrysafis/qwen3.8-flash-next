@@ -423,11 +423,11 @@ class StreamedNGramEmbedding(nn.Module):
             blocks.append(gid + self.ngram_heads_offsets[lo:hi].reshape(1, 1, -1))
         return mx.concatenate(blocks, -1)[:, -n_new:]
 
-    def prefetch(self, ids, prev_context):
-        self.store.prefetch_rows(self.indices(ids, prev_context))
+    def prefetch(self, gid):
+        self.store.prefetch_rows(gid)
 
-    def __call__(self, ids, prev_context):
-        gid = self.indices(ids, prev_context)
+    def __call__(self, ids, prev_context, gid=None):
+        gid = self.indices(ids, prev_context) if gid is None else gid
         return self.store.get_rows(gid).reshape(*gid.shape[:2], -1)
 
 
@@ -454,8 +454,8 @@ class PLELayer(nn.Module):
         if cache is not None: cache[2] = mx.contiguous(full[:, -n:])
         return nn.silu(self.conv1d(full[:, -(n + seq):]))
 
-    def __call__(self, hidden, ids, prev_ctx, cache):
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+    def __call__(self, hidden, ids, prev_ctx, cache, gid=None):
+        emb = self.ple_embedding(ids, prev_ctx, gid).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb)).reshape(*emb.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)
         query = self.norm_query(hidden).reshape(*hidden.shape[:-1], self.hc, self.d)
@@ -477,8 +477,8 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
-        if self.ple is not None: h = h + self.ple(h, ids, prev_ctx, cache)
+    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx, ple_gid=None):
+        if self.ple is not None: h = h + self.ple(h, ids, prev_ctx, cache, ple_gid)
         x, hyper, inject = self.attn_hyper_connection(h)
         x = self.linear_attn(x, conv_mask, cache) if self.layer_type == "linear_attention" else self.self_attn(x, rope, mask, cache, idx_cache)
         h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
@@ -504,6 +504,7 @@ class Qwen4ExpModel(nn.Module):
         attn_cache = cache[full[0]] if full else None
         mask = create_attention_mask(h, [attn_cache] if attn_cache is not None else None)
         prev_ctx = None
+        ple_gid = None
         if self.ple_layers:
             ctx_len = self.args.ngram_size - 1
             eos = self.args.eos_token_id[0] if isinstance(self.args.eos_token_id, list) else self.args.eos_token_id
@@ -511,11 +512,13 @@ class Qwen4ExpModel(nn.Module):
             prev = pc[3] if pc is not None else None
             prev_ctx = prev if prev is not None else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             if pc is not None: pc[3] = mx.concatenate([prev_ctx, ids], 1)[:, -ctx_len:]
-            self.layers[self.ple_layers[0]].ple.ple_embedding.prefetch(ids, prev_ctx)
+            ple_embedding = self.layers[self.ple_layers[0]].ple.ple_embedding
+            ple_gid = ple_embedding.indices(ids, prev_ctx)
+            ple_embedding.prefetch(ple_gid)
         h = mx.tile(h, (1, 1, self.hc))
         for layer, state in zip(self.layers, cache):
             idx_cache = state.indexer if state is not None and hasattr(state, "indexer") else None
-            h = layer(h, self.rope, mask, None, state, idx_cache, ids, prev_ctx)
+            h = layer(h, self.rope, mask, None, state, idx_cache, ids, prev_ctx, ple_gid)
         return self.hyper_connection_mixer(h)
 
 
