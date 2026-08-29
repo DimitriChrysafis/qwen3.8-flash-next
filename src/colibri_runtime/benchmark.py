@@ -7,10 +7,23 @@ import time
 from pathlib import Path
 
 
-def run_cmd(cmd: list[str]) -> tuple[int, str, str, float]:
+def run_streaming(cmd: list[str]) -> tuple[int, str, str, float, float | None]:
     t0 = time.time()
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return p.returncode, p.stdout, p.stderr, time.time() - t0
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert p.stdout is not None
+    chunks: list[str] = []
+    first_token_at: float | None = None
+    while True:
+        ch = p.stdout.read(1)
+        if ch == "" and p.poll() is not None:
+            break
+        if ch:
+            chunks.append(ch)
+            if first_token_at is None and not ch.isspace():
+                first_token_at = time.time()
+    se = p.stderr.read() if p.stderr is not None else ""
+    rc = p.wait()
+    return rc, "".join(chunks), se, time.time() - t0, (first_token_at - t0) if first_token_at else None
 
 
 def parse_llama_timings(text: str) -> dict[str, float]:
@@ -53,14 +66,21 @@ def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, n
         "--gpu-layers",
         ngl,
     ]
-    rc, so, se, wall = run_cmd(cmd)
+    timed_cmd = ["/usr/bin/time", "-l", *cmd]
+    rc, so, se, wall, ttft = run_streaming(timed_cmd)
     parsed = parse_llama_timings(so + "\n" + se)
+    rss = None
+    m = re.search(r"(\d+)\s+maximum resident set size", se)
+    if m:
+        rss = int(m.group(1))
     return {
-        "cmd": cmd,
+        "cmd": timed_cmd,
         "returncode": rc,
         "wall_s": wall,
+        "ttft_s": ttft,
+        "max_rss_bytes": rss,
         "timings": parsed,
-        "stderr_tail": se[-2000:],
+        "stderr_tail": se[-4000:],
         "stdout_tail": so[-2000:],
     }
 
