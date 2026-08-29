@@ -118,54 +118,95 @@ class ExpertStore:
         if shape[0] != self.num_experts:
             raise ValueError(f"expert count {shape[0]} != config {self.num_experts}")
 
-    def _read_linear(self, layer: int, expert: int, proj: str) -> tuple[LinearSlice, int]:
+    def _read_linear_many(self, layer: int, experts: tuple[int, ...], proj: str):
         weight_name = self._name(layer, proj, "weight")
-        weight = self.index.read_row_numpy(weight_name, expert)
-        nbytes = self.index.tensors[weight_name].row_bytes
+        weights = self.index.read_rows_numpy(weight_name, experts)
+        row_bytes = self.index.tensors[weight_name].row_bytes
         scales_name = self._name(layer, proj, "scales")
         biases_name = self._name(layer, proj, "biases")
         if scales_name not in self.index.tensors:
-            return LinearSlice(weight), nbytes
-        scales = self.index.read_row_numpy(scales_name, expert)
-        biases = self.index.read_row_numpy(biases_name, expert) if biases_name in self.index.tensors else None
-        nbytes += self.index.tensors[scales_name].row_bytes
+            return [LinearSlice(weight) for weight in weights], row_bytes
+        scales = self.index.read_rows_numpy(scales_name, experts)
+        biases = self.index.read_rows_numpy(biases_name, experts) if biases_name in self.index.tensors else None
+        row_bytes += self.index.tensors[scales_name].row_bytes
         if biases is not None:
-            nbytes += self.index.tensors[biases_name].row_bytes
-        return LinearSlice(weight, scales, biases, self.group_size, self.bits), nbytes
+            row_bytes += self.index.tensors[biases_name].row_bytes
+        return [
+            LinearSlice(weights[i], scales[i], None if biases is None else biases[i],
+                        self.group_size, self.bits)
+            for i in range(len(experts))
+        ], row_bytes
 
-    def _load(self, key: tuple[int, int]) -> ExpertSlice:
+    def _load_many(self, layer: int, experts: tuple[int, ...]):
         t0 = time.perf_counter()
-        layer, expert = key
-        gate, ng = self._read_linear(layer, expert, "gate")
-        up, nu = self._read_linear(layer, expert, "up")
-        down, nd = self._read_linear(layer, expert, "down")
-        value = ExpertSlice(gate, up, down, ng + nu + nd)
+        gates, ng = self._read_linear_many(layer, experts, "gate")
+        ups, nu = self._read_linear_many(layer, experts, "up")
+        downs, nd = self._read_linear_many(layer, experts, "down")
+        nbytes = ng + nu + nd
+        values = {
+            (layer, expert): ExpertSlice(gates[i], ups[i], downs[i], nbytes)
+            for i, expert in enumerate(experts)
+        }
         with self._lock:
-            self.stats.loads += 1
-            self.stats.loaded_bytes += value.nbytes
+            self.stats.loads += len(experts)
+            self.stats.loaded_bytes += len(experts) * nbytes
             self.stats.load_seconds += time.perf_counter() - t0
-        return value
+        return values
+
+    def request_many(self, layer: int, experts: Iterable[int], prefetch: bool = False):
+        layer = int(layer)
+        keys = []
+        with self._lock:
+            available = self._max_speculative - len(self._future_prefetch) if prefetch else None
+            for expert in dict.fromkeys(map(int, experts)):
+                key = (layer, expert)
+                if self.cache.peek(key) is None and key not in self._futures:
+                    if available is not None and len(keys) >= max(0, available):
+                        break
+                    keys.append(key)
+            if not keys:
+                return {}
+            ids = tuple(expert for _, expert in keys)
+            group_future = self.index.executor.submit(self._load_many, layer, ids)
+            children = {}
+            for key in keys:
+                child = Future()
+                self._futures[key] = child
+                children[key] = child
+            if prefetch:
+                self._future_prefetch.update(keys)
+                self.stats.prefetch_submitted += len(keys)
+
+        def finish(future):
+            try:
+                values = future.result()
+                for key, value in values.items():
+                    children[key].set_result(value)
+            except BaseException as exc:
+                for child in children.values():
+                    child.set_exception(exc)
+
+        group_future.add_done_callback(finish)
+        return children
 
     def request(self, layer: int, expert: int, prefetch: bool = False) -> Future | None:
         key = (int(layer), int(expert))
         if self.cache.peek(key) is not None:
             return None
         with self._lock:
-            if key in self._futures:
-                return self._futures[key]
-            speculative = sum(k in self._future_prefetch for k in self._futures)
-            if prefetch and speculative >= self._max_speculative:
-                return None
-            future = self.index.executor.submit(self._load, key)
-            self._futures[key] = future
-            if prefetch:
-                self._future_prefetch.add(key)
-                self.stats.prefetch_submitted += 1
-            return future
+            existing = self._futures.get(key)
+        if existing is not None:
+            return existing
+        child = self.request_many(layer, [expert], prefetch).get(key)
+        if child is not None:
+            return child
+        with self._lock:
+            return self._futures.get(key)
 
     def prepare(self, layer: int, experts: Iterable[int]) -> None:
-        for expert in list(experts)[:self.io_window]:
-            self.request(layer, int(expert))
+        experts = list(dict.fromkeys(map(int, experts)))
+        for start in range(0, len(experts), 32):
+            self.request_many(layer, experts[start:start + 32])
 
     def get(self, layer: int, expert: int) -> ExpertSlice:
         key = (int(layer), int(expert))

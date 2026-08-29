@@ -86,6 +86,22 @@ def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
     index.close()
 
 
+def test_expert_batch_coalesces_contiguous_reads(tmp_path):
+    tiny_file(tmp_path)
+    index = SafeTensorIndex(tmp_path, workers=3)
+    one_bytes = sum(index.tensors[f"model.layers.0.mlp.switch_mlp.{p}_proj.{suffix}"].row_bytes
+                    for p in ("gate", "up", "down") for suffix in ("weight", "scales", "biases"))
+    store = ExpertStore(index, budget_bytes=one_bytes * 4, num_layers=1, num_experts=4,
+                        group_size=32, bits=4, prefetch=0)
+    store.prepare(0, range(4))
+    for expert in range(4):
+        store.get(0, expert)
+    assert index.snapshot()["pread_calls"] == 9
+    assert store.snapshot()["loaded_bytes"] == one_bytes * 4
+    store.close()
+    index.close()
+
+
 def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
     _, ple = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)
