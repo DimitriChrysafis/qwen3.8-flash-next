@@ -119,7 +119,7 @@ class SafeTensorIndex:
 
     @staticmethod
     def _numpy(data: bytes, dtype: str, shape: tuple[int, ...]) -> np.ndarray:
-        return np.frombuffer(data, dtype=_DTYPES[dtype][0]).reshape(shape).copy()
+        return np.frombuffer(data, dtype=_DTYPES[dtype][0]).reshape(shape)
 
     @classmethod
     def _array(cls, data: bytes, dtype: str, shape: tuple[int, ...]) -> mx.array:
