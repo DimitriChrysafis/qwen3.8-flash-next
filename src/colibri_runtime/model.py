@@ -313,7 +313,8 @@ class StreamedSparseMoeBlock(nn.Module):
         unique = np.unique(idx_np)
         unique_ids = unique.tolist()
         self.store.prepare(self.layer_idx, unique_ids)
-        slots = mx.zeros((flat_x.shape[0] * self.top_k, x.shape[-1]), dtype=x.dtype)
+        routed_positions = []
+        routed_results = []
         for position, expert_id in enumerate(unique_ids):
             token, slot = np.nonzero(idx_np == expert_id)
             positions = token * self.top_k + slot
@@ -322,7 +323,14 @@ class StreamedSparseMoeBlock(nn.Module):
             ahead = position + self.store.io_window
             if ahead < len(unique_ids):
                 self.store.request(self.layer_idx, unique_ids[ahead])
-            slots = mx.put_along_axis(slots, mx.array(positions)[:, None], result, axis=0)
+            routed_positions.append(mx.array(positions))
+            routed_results.append(result)
+        positions = mx.concatenate(routed_positions)
+        results = mx.concatenate(routed_results, axis=0)
+        slots = mx.put_along_axis(
+            mx.zeros((flat_x.shape[0] * self.top_k, x.shape[-1]), dtype=x.dtype),
+            positions[:, None], results, axis=0,
+        )
         routed = slots.reshape(flat_x.shape[0], self.top_k, -1)
         routed = (routed * weights.reshape(-1, self.top_k)[..., None]).sum(1).reshape(x.shape)
         self.store.record_route(self.layer_idx, idx_np.reshape(-1).tolist())
