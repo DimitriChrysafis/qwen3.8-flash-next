@@ -1,5 +1,3 @@
-# Copyright 2026 The Qwen Team, The HuggingFace Inc. team, and PipeNetwork contributors.
-# Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import threading

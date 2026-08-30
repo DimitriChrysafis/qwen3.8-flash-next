@@ -1,6 +1,3 @@
-# Copyright 2026 The Qwen Team, The HuggingFace Inc. team, and PipeNetwork contributors.
-# Adapted and modified for disk-streamed Colibri execution.
-# Licensed under the Apache License, Version 2.0.
 from __future__ import annotations
 
 import math
