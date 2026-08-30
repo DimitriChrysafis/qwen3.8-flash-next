@@ -6,40 +6,56 @@ import re
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 
-def run_streaming(cmd: list[str], prompt: str) -> tuple[int, str, str, float, float | None]:
-    t0 = time.time()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    assert p.stdout is not None and p.stderr is not None
+def run_streaming(cmd: Sequence[str], prompt: str) -> tuple[int, str, str, float, float | None]:
+    started = time.perf_counter()
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        raise RuntimeError("benchmark process did not expose output pipes")
     chunks: list[str] = []
     errors: list[str] = []
-    drain = threading.Thread(target=lambda: errors.extend(iter(p.stderr.readline, "")), daemon=True)
+    drain = threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True)
     drain.start()
     first_token_at: float | None = None
     marker = f"> {prompt}"
     armed = False
+    marker_window = ""
     while True:
-        ch = p.stdout.read(1)
-        if ch == "" and p.poll() is not None:
+        ch = process.stdout.read(1)
+        if ch == "" and process.poll() is not None:
             break
         if not ch:
             continue
         chunks.append(ch)
-        if not armed and marker in "".join(chunks[-len(marker) - 2:]):
-            armed = True
-        elif armed and first_token_at is None and not ch.isspace():
-            first_token_at = time.time()
-    rc = p.wait()
+        if not armed:
+            marker_window = (marker_window + ch)[-len(marker) :]
+            armed = marker_window == marker
+        elif first_token_at is None and not ch.isspace():
+            first_token_at = time.perf_counter()
+    rc = process.wait()
     drain.join()
-    return rc, "".join(chunks), "".join(errors), time.time() - t0, (first_token_at - t0) if first_token_at else None
+    finished = time.perf_counter()
+    return (
+        rc,
+        "".join(chunks),
+        "".join(errors),
+        finished - started,
+        first_token_at - started if first_token_at is not None else None,
+    )
 
 
 def parse_llama_timings(text: str) -> dict[str, float]:
     patterns = {
         "load_s": r"load time =\s*([\d.]+) ms",
-        "prompt_tps": r"prompt eval time =\s*[\d.]+ ms /\s*\d+ tokens .*?,\s*([\d.]+) tokens per second",
+        "prompt_tps": (
+            r"prompt eval time =\s*[\d.]+ ms /\s*\d+ tokens .*?,\s*"
+            r"([\d.]+) tokens per second"
+        ),
         "gen_tps": r"eval time =\s*[\d.]+ ms /\s*\d+ runs .*?,\s*([\d.]+) tokens per second",
     }
     out: dict[str, float] = {}
@@ -57,7 +73,11 @@ def parse_llama_timings(text: str) -> dict[str, float]:
     return out
 
 
-def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, ngl: str) -> dict:
+def benchmark(
+    model: str, prompt: str, n_predict: int, ctx: int, threads: int, ngl: str
+) -> dict[str, object]:
+    if n_predict < 0 or ctx < 1 or threads < 1:
+        raise ValueError("n_predict must be nonnegative, ctx and threads must be positive")
     executable = os.environ.get(
         "COLIBRI_LLAMA_CLI",
         str(Path.home() / "qwen3.8next/llama.cpp/build/bin/llama-cli"),
@@ -95,7 +115,7 @@ def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, n
         "--fit",
         "off",
     ]
-    timed_cmd = ["/usr/bin/time", "-l", *cmd]
+    timed_cmd = ["/usr/bin/time", "-l", *cmd] if Path("/usr/bin/time").is_file() else cmd
     rc, so, se, wall, ttft = run_streaming(timed_cmd, prompt)
     parsed = parse_llama_timings(so + "\n" + se)
     rss = None
@@ -114,6 +134,7 @@ def benchmark(model: str, prompt: str, n_predict: int, ctx: int, threads: int, n
     }
 
 
-def write_json(path: str, obj: dict) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps(obj, indent=2))
+def write_json(path: str | Path, obj: dict[str, object]) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(obj, indent=2), encoding="utf-8")

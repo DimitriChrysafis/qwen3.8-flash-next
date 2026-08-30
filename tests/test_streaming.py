@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 import struct
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import pytest
 from safetensors.numpy import save_file
 
+import colibri_runtime.storage as storage
 from colibri_runtime.storage import SafeTensorIndex
 from colibri_runtime.streaming import ExpertStore, PLEStore
 
@@ -14,9 +17,11 @@ from colibri_runtime.streaming import ExpertStore, PLEStore
 def qstack(array, group_size=32, bits=4):
     shape = array.shape
     q, s, b = mx.quantize(mx.array(array.reshape(-1, shape[-1])), group_size=group_size, bits=bits)
-    return (np.array(q).reshape(*shape[:-1], q.shape[-1]),
-            np.array(s).reshape(*shape[:-1], s.shape[-1]),
-            np.array(b).reshape(*shape[:-1], b.shape[-1]))
+    return (
+        np.array(q).reshape(*shape[:-1], q.shape[-1]),
+        np.array(s).reshape(*shape[:-1], s.shape[-1]),
+        np.array(b).reshape(*shape[:-1], b.shape[-1]),
+    )
 
 
 def tiny_file(path):
@@ -33,7 +38,7 @@ def tiny_file(path):
         tensors[f"{base}.biases"] = b
     ple = rng.normal(size=(16, 32)).astype(np.float32)
     for shard in range(2):
-        q, s, b = qstack(ple[shard * 8:(shard + 1) * 8])
+        q, s, b = qstack(ple[shard * 8 : (shard + 1) * 8])
         base = f"language_model.model.layers.0.ple.ple_embedding.ngram_embedding.shard_{shard}"
         tensors[f"{base}.weight"] = q
         tensors[f"{base}.scales"] = s
@@ -59,6 +64,53 @@ def test_header_and_exact_row_ranges(tmp_path):
     index.close()
 
 
+def test_index_rejects_invalid_rows_and_is_idempotently_closed(tmp_path):
+    tiny_file(tmp_path)
+    index = SafeTensorIndex(tmp_path)
+    name = "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    with pytest.raises(TypeError):
+        index.read_rows_numpy(name, [1.5])
+    with pytest.raises(IndexError):
+        index.read_rows_numpy(name, [8])
+    index.close()
+    index.close()
+    with pytest.raises(RuntimeError):
+        index.read_tensor(name)
+
+
+def test_empty_row_request_does_not_read_from_disk(tmp_path):
+    tiny_file(tmp_path)
+    with SafeTensorIndex(tmp_path) as index:
+        name = "model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight"
+        rows = index.read_rows_numpy(name, [])
+        assert rows.shape == (0, *index.tensors[name].shape[1:])
+        assert index.snapshot()["pread_calls"] == 0
+
+
+def test_python_row_reader_matches_native_path(tmp_path, monkeypatch):
+    experts, _ = tiny_file(tmp_path)
+    monkeypatch.setattr(storage, "_rowio", None)
+    with SafeTensorIndex(tmp_path) as index:
+        name = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+        rows = index.read_rows_numpy(name, [3, 1, 3, 2])
+        expected = qstack(experts["gate"])[0][[3, 1, 3, 2]]
+        np.testing.assert_array_equal(rows, expected)
+        assert index.snapshot()["pread_calls"] == 1
+
+
+def test_index_rejects_overlapping_tensor_ranges(tmp_path):
+    header = {
+        "first": {"dtype": "U8", "shape": [4], "data_offsets": [0, 4]},
+        "second": {"dtype": "U8", "shape": [2], "data_offsets": [2, 4]},
+    }
+    encoded = json.dumps(header).encode()
+    (tmp_path / "invalid.safetensors").write_bytes(
+        struct.pack("<Q", len(encoded)) + encoded + b"\0" * 4
+    )
+    with pytest.raises(ValueError, match="overlapping"):
+        SafeTensorIndex(tmp_path)
+
+
 def test_row_reads_restore_order_and_deduplicate(tmp_path):
     _, _ = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path)
@@ -77,10 +129,20 @@ def test_row_reads_restore_order_and_deduplicate(tmp_path):
 def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
     experts, _ = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)
-    one_bytes = sum(index.tensors[f"model.layers.0.mlp.switch_mlp.{p}_proj.{suffix}"].row_bytes
-                    for p in ("gate", "up", "down") for suffix in ("weight", "scales", "biases"))
-    store = ExpertStore(index, budget_bytes=one_bytes * 2, num_layers=1, num_experts=4,
-                        group_size=32, bits=4, prefetch=2)
+    one_bytes = sum(
+        index.tensors[f"model.layers.0.mlp.switch_mlp.{p}_proj.{suffix}"].row_bytes
+        for p in ("gate", "up", "down")
+        for suffix in ("weight", "scales", "biases")
+    )
+    store = ExpertStore(
+        index,
+        budget_bytes=one_bytes * 2,
+        num_layers=1,
+        num_experts=4,
+        group_size=32,
+        bits=4,
+        prefetch=2,
+    )
     future = store.request(0, 2, prefetch=True)
     future.result()
     store.prepare(0, [])
@@ -92,13 +154,18 @@ def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
     qu = mx.quantize(mx.array(experts["up"][2]), group_size=32, bits=4)
     qd = mx.quantize(mx.array(experts["down"][2]), group_size=32, bits=4)
     expected = mx.quantized_matmul(
-        nn.silu(mx.quantized_matmul(x, *qg, group_size=32, bits=4)) *
-        mx.quantized_matmul(x, *qu, group_size=32, bits=4), *qd, group_size=32, bits=4)
+        nn.silu(mx.quantized_matmul(x, *qg, group_size=32, bits=4))
+        * mx.quantized_matmul(x, *qu, group_size=32, bits=4),
+        *qd,
+        group_size=32,
+        bits=4,
+    )
     np.testing.assert_allclose(out, np.array(expected), rtol=1e-5, atol=1e-5)
     assert store.snapshot()["prefetch_hits"] == 1
     assert store.snapshot()["loaded_bytes"] == one_bytes
     assert store.snapshot()["wait_seconds"] >= 0
-    store.get(0, 0); store.get(0, 1)
+    store.get(0, 0)
+    store.get(0, 1)
     assert store.cache.snapshot()["bytes"] <= one_bytes * 2
     assert store.cache.snapshot()["evictions"] >= 1
     index.close()
@@ -107,10 +174,20 @@ def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
 def test_expert_batch_coalesces_contiguous_reads(tmp_path):
     tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)
-    one_bytes = sum(index.tensors[f"model.layers.0.mlp.switch_mlp.{p}_proj.{suffix}"].row_bytes
-                    for p in ("gate", "up", "down") for suffix in ("weight", "scales", "biases"))
-    store = ExpertStore(index, budget_bytes=one_bytes * 4, num_layers=1, num_experts=4,
-                        group_size=32, bits=4, prefetch=0)
+    one_bytes = sum(
+        index.tensors[f"model.layers.0.mlp.switch_mlp.{p}_proj.{suffix}"].row_bytes
+        for p in ("gate", "up", "down")
+        for suffix in ("weight", "scales", "biases")
+    )
+    store = ExpertStore(
+        index,
+        budget_bytes=one_bytes * 4,
+        num_layers=1,
+        num_experts=4,
+        group_size=32,
+        bits=4,
+        prefetch=0,
+    )
     store.prepare(0, range(4))
     for expert in range(4):
         store.get(0, expert)
@@ -123,8 +200,9 @@ def test_expert_batch_coalesces_contiguous_reads(tmp_path):
 def test_route_frequency_counts_token_assignments(tmp_path):
     tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path)
-    store = ExpertStore(index, budget_bytes=4096, num_layers=1, num_experts=4,
-                        group_size=32, bits=4, prefetch=0)
+    store = ExpertStore(
+        index, budget_bytes=4096, num_layers=1, num_experts=4, group_size=32, bits=4, prefetch=0
+    )
     store.cache.put((0, 1), object(), 1)
     store.record_route(0, [1, 1, 1, 1, 2])
     snapshot = store.snapshot()
@@ -138,16 +216,26 @@ def test_route_frequency_counts_token_assignments(tmp_path):
 def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
     _, ple = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)
-    row_bytes = sum(index.tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.{s}"].row_bytes
-                    for s in ("weight", "scales", "biases"))
-    store = PLEStore(index, row_bytes * 4, layer=0, n_shards=2, rows_per_shard=8,
-                     group_size=32, bits=4, prefetch=8)
+    row_bytes = sum(
+        index.tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.{s}"].row_bytes
+        for s in ("weight", "scales", "biases")
+    )
+    store = PLEStore(
+        index,
+        row_bytes * 4,
+        layer=0,
+        n_shards=2,
+        rows_per_shard=8,
+        group_size=32,
+        bits=4,
+        prefetch=8,
+    )
     gids = mx.array([[1, 9, 1, 7]])
     store.prefetch_rows(gids)
     out = np.array(store.get_rows(gids))
     expected = []
     for gid in [1, 9, 1, 7]:
-        q, s, b = mx.quantize(mx.array(ple[gid:gid + 1]), group_size=32, bits=4)
+        q, s, b = mx.quantize(mx.array(ple[gid : gid + 1]), group_size=32, bits=4)
         expected.append(np.array(mx.dequantize(q, s, b, group_size=32, bits=4))[0])
     np.testing.assert_allclose(out.reshape(4, 32), np.stack(expected), rtol=1e-5, atol=1e-5)
     snap = store.snapshot()
@@ -163,10 +251,20 @@ def test_ple_only_requested_rows_dequant_and_local_prefetch(tmp_path):
 def test_ple_reads_exactly_sixteen_required_rows(tmp_path):
     tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=2)
-    row_bytes = sum(index.tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.{s}"].row_bytes
-                    for s in ("weight", "scales", "biases"))
-    store = PLEStore(index, row_bytes * 8, layer=0, n_shards=2, rows_per_shard=8,
-                     group_size=32, bits=4, prefetch=0)
+    row_bytes = sum(
+        index.tensors[f"model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.{s}"].row_bytes
+        for s in ("weight", "scales", "biases")
+    )
+    store = PLEStore(
+        index,
+        row_bytes * 8,
+        layer=0,
+        n_shards=2,
+        rows_per_shard=8,
+        group_size=32,
+        bits=4,
+        prefetch=0,
+    )
     before = index.snapshot()["bytes_read"]
     out = store.get_rows(mx.arange(16).reshape(1, 1, 16))
     mx.eval(out)

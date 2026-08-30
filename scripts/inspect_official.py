@@ -4,16 +4,20 @@ from __future__ import annotations
 import json
 import urllib.request
 from pathlib import Path
+from typing import Any
 
-BASE = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
-
-
-def load_json(name: str) -> dict:
-    with urllib.request.urlopen(BASE + name, timeout=30) as r:
-        return json.load(r)
+BASE_URL = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 
 
-def main() -> None:
+def load_json(name: str) -> dict[str, Any]:
+    with urllib.request.urlopen(BASE_URL + name, timeout=30) as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object for {name}")
+    return payload
+
+
+def main() -> int:
     cfg = load_json("config.json")
     idx = load_json("model.safetensors.index.json")
     tok_cfg = load_json("tokenizer_config.json")
@@ -36,9 +40,10 @@ def main() -> None:
     }
     out = Path(__file__).resolve().parents[1] / "artifacts/official_summary.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(summary, indent=2))
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

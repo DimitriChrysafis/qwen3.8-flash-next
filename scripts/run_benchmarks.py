@@ -9,7 +9,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 MODEL = Path.home() / "qwen3.8next/models/pipenetwork-Qwen3.8-Flash-Next-MLX-4bit"
 BASE = (
     "Explain how a disk-backed sparse mixture-of-experts runtime routes tokens, "
@@ -22,9 +21,16 @@ PROMPTS = {
 }
 
 
-def system_snapshot() -> dict:
-    memory = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
-    chip = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True).strip()
+def _sysctl(name: str) -> str:
+    try:
+        return subprocess.check_output(["sysctl", "-n", name], text=True).strip()
+    except FileNotFoundError as error:
+        raise RuntimeError("system benchmarks require macOS sysctl") from error
+
+
+def system_snapshot() -> dict[str, object]:
+    memory = _sysctl("hw.memsize")
+    chip = _sysctl("machdep.cpu.brand_string")
     disk = shutil.disk_usage(Path.home())
     return {
         "platform": platform.platform(),
@@ -35,27 +41,50 @@ def system_snapshot() -> dict:
     }
 
 
-def run_case(args, name, prompt) -> dict:
+def run_case(args: argparse.Namespace, name: str, prompt: str) -> dict[str, object]:
     command = [
-        sys.executable, "-m", "colibri_runtime.cli",
-        "--model", str(args.model),
-        "--expert-budget-gib", str(args.expert_budget_gib),
-        "--ple-budget-gib", str(args.ple_budget_gib),
-        "--mlx-cache-gib", str(args.mlx_cache_gib),
-        "--mlx-memory-gib", str(args.mlx_memory_gib),
-        "--io-workers", str(args.io_workers),
-        "--expert-prefetch", str(args.expert_prefetch),
-        "--ple-prefetch", str(args.ple_prefetch),
-        "benchmark", "--prompt", prompt,
-        "--max-tokens", str(args.max_tokens),
-        "--runs", str(args.runs),
+        sys.executable,
+        "-m",
+        "colibri_runtime.cli",
+        "--model",
+        str(args.model),
+        "--expert-budget-gib",
+        str(args.expert_budget_gib),
+        "--ple-budget-gib",
+        str(args.ple_budget_gib),
+        "--mlx-cache-gib",
+        str(args.mlx_cache_gib),
+        "--mlx-memory-gib",
+        str(args.mlx_memory_gib),
+        "--io-workers",
+        str(args.io_workers),
+        "--expert-prefetch",
+        str(args.expert_prefetch),
+        "--ple-prefetch",
+        str(args.ple_prefetch),
+        "benchmark",
+        "--prompt",
+        prompt,
+        "--max-tokens",
+        str(args.max_tokens),
+        "--runs",
+        str(args.runs),
     ]
-    process = subprocess.run(command, text=True, capture_output=True)
+    process = subprocess.run(command, text=True, capture_output=True, check=False)
     if process.returncode:
-        return {"name": name, "command": command, "returncode": process.returncode,
-                "stdout": process.stdout[-4000:], "stderr": process.stderr[-4000:]}
-    return {"name": name, "command": command, "returncode": 0,
-            "metrics": json.loads(process.stdout)}
+        return {
+            "name": name,
+            "command": command,
+            "returncode": process.returncode,
+            "stdout": process.stdout[-4000:],
+            "stderr": process.stderr[-4000:],
+        }
+    return {
+        "name": name,
+        "command": command,
+        "returncode": 0,
+        "metrics": json.loads(process.stdout),
+    }
 
 
 def main() -> int:
@@ -78,7 +107,7 @@ def main() -> int:
         "cases": [run_case(args, name, prompt) for name, prompt in PROMPTS.items()],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, indent=2))
+    args.output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(json.dumps(result, indent=2))
     return 0 if all(case["returncode"] == 0 for case in result["cases"]) else 1
 

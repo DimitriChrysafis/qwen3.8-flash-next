@@ -71,7 +71,7 @@ static int read_fully(int fd, char *buffer, size_t length, uint64_t offset,
     return 1;
 }
 
-static PyObject *read_rows(PyObject *module, PyObject *args) {
+static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
     int fd;
     unsigned long long base_offset;
     Py_ssize_t row_bytes;
@@ -231,6 +231,10 @@ static struct PyModuleDef rowio_module = {
     "GIL-free contiguous safetensor row reads.",
     -1,
     rowio_methods,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
 };
 
 PyMODINIT_FUNC PyInit__rowio(void) {

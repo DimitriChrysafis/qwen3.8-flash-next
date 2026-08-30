@@ -1,3 +1,5 @@
+import pytest
+
 from colibri_runtime import ExpertCache, NgramDiskCache
 
 
@@ -27,9 +29,29 @@ def test_layer_partition_evicts_overrepresented_layer() -> None:
     assert c.snapshot()["partition_bytes"] == {"0": 2, "1": 2}
 
 
+def test_rejected_replacement_preserves_existing_value() -> None:
+    cache = ExpertCache(max_bytes=2)
+    assert cache.put("key", "old", nbytes=2)
+    assert not cache.put("key", "new", nbytes=3)
+    assert cache.get("key") == "old"
+    snapshot = cache.snapshot()
+    assert snapshot["rejected"] == 1
+    assert snapshot["evictions"] == 0
+    assert snapshot["bytes"] == 2
+
+
+def test_cache_requires_positive_limits() -> None:
+    with pytest.raises(ValueError, match="max_items"):
+        ExpertCache(max_items=0)
+    with pytest.raises(ValueError, match="max_bytes"):
+        ExpertCache(max_bytes=0)
+
+
 def test_ngram_disk_cache(tmp_path) -> None:
-    db = NgramDiskCache(str(tmp_path / "ngrams.sqlite"))
-    assert db.get("x") is None
-    db.put("x", b"abc")
-    assert db.get("x") == b"abc"
-    assert db.count() == 1
+    with NgramDiskCache(tmp_path / "ngrams.sqlite") as db:
+        assert db.get("x") is None
+        db.put("x", b"abc")
+        assert db.get("x") == b"abc"
+        assert db.count() == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        db.count()

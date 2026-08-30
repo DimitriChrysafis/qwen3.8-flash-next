@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from collections.abc import Hashable
 from dataclasses import asdict, dataclass
 from time import monotonic
-from typing import Any, Hashable
+from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class CacheStats:
     hits: int = 0
     misses: int = 0
@@ -18,7 +19,7 @@ class CacheStats:
     rejected: int = 0
 
 
-@dataclass
+@dataclass(slots=True)
 class _Entry:
     value: Any
     nbytes: int
@@ -38,6 +39,10 @@ class ExpertCache:
     ) -> None:
         if max_items is None and max_bytes is None:
             raise ValueError("max_items or max_bytes is required")
+        if max_items is not None and max_items < 1:
+            raise ValueError("max_items must be positive")
+        if max_bytes is not None and max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
         if policy not in {"lru", "lfu", "adaptive"}:
             raise ValueError("policy must be lru, lfu, or adaptive")
         if partitions is not None and partitions < 1:
@@ -84,30 +89,38 @@ class ExpertCache:
         size = int(nbytes if nbytes is not None else getattr(value, "nbytes", 1))
         if size < 0:
             raise ValueError("nbytes must be nonnegative")
+        if self.max_bytes is not None and size > self.max_bytes:
+            with self._lock:
+                self.stats.rejected += 1
+            return False
         with self._lock:
+            previous_items = self._items.copy()
+            previous_usage = self._partition_usage.copy()
+            previous_bytes = self.stats.bytes
             old = self._items.pop(key, None)
             if old is not None:
-                self.stats.bytes -= old.nbytes
-                self._adjust_partition(key, -old.nbytes)
+                self._remove_bytes(key, old.nbytes)
                 pin = pin or old.pinned
                 hot = hot or old.hot
-            if self.max_bytes is not None and size > self.max_bytes:
-                self.stats.rejected += 1
-                return False
-            while ((self.max_items is not None and len(self._items) + 1 > self.max_items) or
-                   (self.max_bytes is not None and self.stats.bytes + size > self.max_bytes)):
+            evictions = 0
+            while (self.max_items is not None and len(self._items) + 1 > self.max_items) or (
+                self.max_bytes is not None and self.stats.bytes + size > self.max_bytes
+            ):
                 victim = self._victim()
                 if victim is None:
+                    self._items = previous_items
+                    self._partition_usage = previous_usage
+                    self.stats.bytes = previous_bytes
                     self.stats.rejected += 1
                     self._update_pinned()
                     return False
                 entry = self._items.pop(victim)
-                self.stats.bytes -= entry.nbytes
-                self._adjust_partition(victim, -entry.nbytes)
-                self.stats.evictions += 1
+                self._remove_bytes(victim, entry.nbytes)
+                evictions += 1
             self._items[key] = _Entry(value, size, pin, hot, 1, monotonic())
             self.stats.bytes += size
             self._adjust_partition(key, size)
+            self.stats.evictions += evictions
             self.stats.peak_bytes = max(self.stats.peak_bytes, self.stats.bytes)
             self._update_pinned()
             return True
@@ -136,12 +149,17 @@ class ExpertCache:
             self._items[key].hot = hot
             return True
 
+    def _remove_bytes(self, key: Hashable, nbytes: int) -> None:
+        self.stats.bytes -= nbytes
+        self._adjust_partition(key, -nbytes)
+
     def _over(self) -> bool:
-        return ((self.max_items is not None and len(self._items) > self.max_items) or
-                (self.max_bytes is not None and self.stats.bytes > self.max_bytes))
+        return (self.max_items is not None and len(self._items) > self.max_items) or (
+            self.max_bytes is not None and self.stats.bytes > self.max_bytes
+        )
 
     @staticmethod
-    def _partition(key: Hashable):
+    def _partition(key: Hashable) -> Hashable | None:
         return key[0] if isinstance(key, tuple) and key else None
 
     def _adjust_partition(self, key: Hashable, delta: int) -> None:
@@ -152,21 +170,21 @@ class ExpertCache:
         else:
             self._partition_usage.pop(partition, None)
 
-    def _partition_bytes(self):
+    def _partition_bytes(self) -> dict[Hashable | None, int]:
         return dict(self._partition_usage)
 
-    def _victim(self, protected: Hashable | None = None) -> Hashable | None:
-        candidates = [(k, e) for k, e in self._items.items() if not e.pinned and k != protected]
+    def _victim(self) -> Hashable | None:
+        candidates = [(k, e) for k, e in self._items.items() if not e.pinned]
         if not candidates:
-            if protected is not None:
-                e = self._items.get(protected)
-                return protected if e is not None and not e.pinned else None
             return None
         if self.partitions is not None and self.max_bytes is not None:
             usage = self._partition_bytes()
             fair = self.max_bytes / self.partitions
-            over = [(key, entry) for key, entry in candidates
-                    if usage.get(self._partition(key), 0) > fair]
+            over = [
+                (key, entry)
+                for key, entry in candidates
+                if usage.get(self._partition(key), 0) > fair
+            ]
             candidates = over or candidates
         cold = [(k, e) for k, e in candidates if not e.hot]
         candidates = cold or candidates
@@ -177,30 +195,38 @@ class ExpertCache:
         now = monotonic()
         return min(
             candidates,
-            key=lambda item: ((item[1].frequency + (4 if item[1].hot else 0)) /
-                              max(item[1].nbytes, 1), item[1].touched - now),
+            key=lambda item: (
+                (item[1].frequency + (4 if item[1].hot else 0)) / max(item[1].nbytes, 1),
+                item[1].touched - now,
+            ),
         )[0]
 
-    def _evict_if_needed(self, protected: Hashable | None = None) -> None:
+    def _evict_if_needed(self) -> None:
         while self._over():
-            victim = self._victim(protected)
+            victim = self._victim()
             if victim is None:
                 break
             entry = self._items.pop(victim)
-            self.stats.bytes -= entry.nbytes
-            self._adjust_partition(victim, -entry.nbytes)
+            self._remove_bytes(victim, entry.nbytes)
             self.stats.evictions += 1
         self._update_pinned()
 
     def _update_pinned(self) -> None:
         self.stats.pinned = sum(entry.pinned for entry in self._items.values())
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         with self._lock:
             out = asdict(self.stats)
-            out.update(size=len(self._items), hot=sum(entry.hot for entry in self._items.values()),
-                       max_items=self.max_items, max_bytes=self.max_bytes, policy=self.policy,
-                       partitions=self.partitions)
+            out.update(
+                size=len(self._items),
+                hot=sum(entry.hot for entry in self._items.values()),
+                max_items=self.max_items,
+                max_bytes=self.max_bytes,
+                policy=self.policy,
+                partitions=self.partitions,
+            )
             if self.partitions is not None:
-                out["partition_bytes"] = {str(key): value for key, value in self._partition_bytes().items()}
+                out["partition_bytes"] = {
+                    str(key): value for key, value in self._partition_bytes().items()
+                }
             return out

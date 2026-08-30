@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
+from typing import Any
 
 import mlx.core as mx
 
@@ -10,11 +12,46 @@ from .generation import MemorySampler, generate_tokens, metrics
 from .load import load
 
 
-def _bytes_gib(value):
-    return int(float(value) * (1 << 30))
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a finite positive number")
+    return parsed
 
 
-def _counters(model):
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a finite nonnegative number")
+    return parsed
+
+
+def _probability(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError("value must be in the interval (0, 1]")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _bytes_gib(value: float) -> int:
+    return int(value * (1 << 30))
+
+
+def _counters(model: Any) -> dict[str, dict]:
     return {
         "expert": model.expert_store.snapshot(),
         "ple": model.ple_store.snapshot(),
@@ -22,13 +59,14 @@ def _counters(model):
     }
 
 
-def _delta(after, before):
-    out = {}
+def _delta(after: dict[str, dict], before: dict[str, dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
     for group in after:
         out[group] = {
             key: value - before[group].get(key, 0)
             for key, value in after[group].items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
             and key not in {"inflight", "completed_prefetch", "ready_prefetch", "prefetch_limit"}
         }
         if "cache" in after[group]:
@@ -40,34 +78,33 @@ def _delta(after, before):
     return out
 
 
-def _parser():
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="colibri-qwen")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--expert-budget-gib", type=float, default=8.0)
-    parser.add_argument("--ple-budget-gib", type=float, default=1.0)
-    parser.add_argument("--mlx-cache-gib", type=float, default=1.0)
-    parser.add_argument("--mlx-memory-gib", type=float, default=28.0)
+    parser.add_argument("--expert-budget-gib", type=_positive_float, default=8.0)
+    parser.add_argument("--ple-budget-gib", type=_positive_float, default=1.0)
+    parser.add_argument("--mlx-cache-gib", type=_positive_float, default=1.0)
+    parser.add_argument("--mlx-memory-gib", type=_positive_float, default=28.0)
     parser.add_argument("--cache-policy", choices=["lru", "lfu", "adaptive"], default="adaptive")
-    parser.add_argument("--io-workers", type=int, default=6)
-    parser.add_argument("--expert-prefetch", type=int, default=2)
-    parser.add_argument("--ple-prefetch", type=int, default=8)
+    parser.add_argument("--io-workers", type=_positive_int, default=6)
+    parser.add_argument("--expert-prefetch", type=_nonnegative_int, default=2)
+    parser.add_argument("--ple-prefetch", type=_nonnegative_int, default=8)
     sub = parser.add_subparsers(dest="command", required=True)
     gen = sub.add_parser("generate")
     gen.add_argument("--prompt", required=True)
-    gen.add_argument("--max-tokens", type=int, default=64)
-    gen.add_argument("--temperature", type=float, default=0.0)
-    gen.add_argument("--top-p", type=float, default=1.0)
+    gen.add_argument("--max-tokens", type=_nonnegative_int, default=64)
+    gen.add_argument("--temperature", type=_nonnegative_float, default=0.0)
+    gen.add_argument("--top-p", type=_probability, default=1.0)
     gen.add_argument("--seed", type=int, default=0)
     gen.add_argument("--chat", action="store_true")
     bench = sub.add_parser("benchmark")
     bench.add_argument("--prompt", required=True)
-    bench.add_argument("--max-tokens", type=int, default=32)
-    bench.add_argument("--runs", type=int, default=1)
-    bench.add_argument("--json", action="store_true")
+    bench.add_argument("--max-tokens", type=_nonnegative_int, default=32)
+    bench.add_argument("--runs", type=_positive_int, default=1)
     return parser
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     mx.set_cache_limit(_bytes_gib(args.mlx_cache_gib))
     mx.set_memory_limit(_bytes_gib(args.mlx_memory_gib))
@@ -87,17 +124,29 @@ def main(argv=None):
         )
         loaded = time.perf_counter() - t0
         load_memory = sampler.snapshot()
-        ids = (tokenizer.apply_chat_template(
-            [{"role": "user", "content": args.prompt}], tokenize=True,
-            add_generation_prompt=True, enable_thinking=False,
-        ) if args.command == "generate" and args.chat else tokenizer.encode(args.prompt))
+        ids = (
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": args.prompt}],
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            if args.command == "generate" and args.chat
+            else tokenizer.encode(args.prompt)
+        )
         eos = model.args.text.eos_token_id
         if args.command == "generate":
             sampler.reset()
             counters_before = _counters(model)
             decoder = tokenizer.decode
             generated, timing = generate_tokens(
-                model, ids, args.max_tokens, args.temperature, args.top_p, eos, args.seed,
+                model,
+                ids,
+                args.max_tokens,
+                args.temperature,
+                args.top_p,
+                eos,
+                args.seed,
                 on_token=lambda token: print(decoder([token]), end="", flush=True),
             )
             print()
@@ -111,8 +160,14 @@ def main(argv=None):
                 sampler.reset()
                 counters_before = _counters(model)
                 generated, timing = generate_tokens(model, ids, args.max_tokens, 0.0, 1.0, eos, run)
-                report = metrics(model, len(ids), len(generated), timing,
-                                 loaded if run == 0 else 0.0, sampler.snapshot())
+                report = metrics(
+                    model,
+                    len(ids),
+                    len(generated),
+                    timing,
+                    loaded if run == 0 else 0.0,
+                    sampler.snapshot(),
+                )
                 report["run_counters"] = _delta(_counters(model), counters_before)
                 if run == 0:
                     report["load_memory"] = load_memory
@@ -122,9 +177,7 @@ def main(argv=None):
     finally:
         sampler.close()
         if model is not None:
-            model.expert_store.close()
-            model.ple_store.close()
-            model.expert_store.index.close()
+            model.close()
 
 
 if __name__ == "__main__":

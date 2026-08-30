@@ -61,7 +61,7 @@ Checkpoint accounting from the real loader:
 PYTHONPATH=src .venv/bin/pytest -q tests
 ```
 
-Measured result: `8 passed`. A generated tiny Qwen4Exp checkpoint is compared directly with Transformers 5.16.1 across full, incremental, and chunked execution. Maximum absolute logit error was `4.4703484e-08`; incremental versus full error was `2.9802322e-08`. Separate tests cover exact range reads, 4-bit expert matmul parity, adaptive eviction, asynchronous prefetch, and 16-row PLE lookup.
+Measured result: `29 passed`. A generated tiny Qwen4Exp checkpoint is compared directly with Transformers 5.16.1 across full, incremental, and chunked execution. Maximum absolute logit error was `4.4703484e-08`; incremental versus full error was `2.9802322e-08`. Separate tests cover exact range reads, both native and Python row readers, 4-bit expert matmul parity, adaptive eviction, asynchronous prefetch, generation validation, and 16-row PLE lookup.
 
 ## Benchmarks
 

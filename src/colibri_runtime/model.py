@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,6 +15,18 @@ from mlx_lm.models.cache import ArraysCache, KVCache, _BaseCache
 from mlx_lm.models.gated_delta import gated_delta_update
 
 from .streaming import ExpertStore, PLEStore
+
+
+def _first_eos_token(eos_token_id: int | list[int]) -> int:
+    if isinstance(eos_token_id, list):
+        if not eos_token_id:
+            raise ValueError("eos_token_id must not be empty")
+        token = int(eos_token_id[0])
+    else:
+        token = int(eos_token_id)
+    if token < 0:
+        raise ValueError("eos_token_id must be nonnegative")
+    return token
 
 
 @dataclass
@@ -27,7 +39,7 @@ class TextArgs(BaseModelArgs):
     head_dim: int = 256
     vocab_size: int = 248320
     rms_norm_eps: float = 1e-6
-    layer_types: list = field(default_factory=list)
+    layer_types: list[str] = field(default_factory=list)
     full_attention_interval: int = 4
     num_experts: int = 512
     num_experts_per_tok: int = 10
@@ -52,12 +64,12 @@ class TextArgs(BaseModelArgs):
     make_ngram_vocab_size_divisible_by: int = 128
     split_ngram_parts: int = 128
     ple_embed_dim: int = 2560
-    ple_layer_ids: list = field(default_factory=lambda: [2])
+    ple_layer_ids: list[int] = field(default_factory=lambda: [2])
     ple_conv_kernel_size: int = 4
     seed: int = 1234
-    eos_token_id: Any = 248044
+    eos_token_id: int | list[int] = 248044
     partial_rotary_factor: float = 0.25
-    rope_parameters: dict = field(default_factory=dict)
+    rope_parameters: dict[str, Any] = field(default_factory=dict)
     rope_theta: float = 10_000_000.0
     tie_word_embeddings: bool = False
 
@@ -65,32 +77,106 @@ class TextArgs(BaseModelArgs):
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "qwen4_exp"
-    text_config: dict = field(default_factory=dict)
-    vision_config: dict = field(default_factory=dict)
-    quantization: Any = None
+    text_config: dict[str, Any] = field(default_factory=dict)
+    vision_config: dict[str, Any] = field(default_factory=dict)
+    quantization: dict[str, Any] | None = None
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.text = TextArgs.from_dict(self.text_config)
+        dimensions = (
+            self.text.hidden_size,
+            self.text.num_hidden_layers,
+            self.text.num_attention_heads,
+            self.text.num_key_value_heads,
+            self.text.head_dim,
+            self.text.vocab_size,
+            self.text.num_experts,
+            self.text.num_experts_per_tok,
+            self.text.moe_intermediate_size,
+            self.text.shared_expert_intermediate_size,
+            self.text.linear_num_key_heads,
+            self.text.linear_num_value_heads,
+            self.text.linear_key_head_dim,
+            self.text.linear_value_head_dim,
+            self.text.linear_conv_kernel_dim,
+            self.text.hc_count,
+            self.text.hc_lowrank,
+            self.text.indexer_n_heads,
+            self.text.indexer_kv_heads,
+            self.text.indexer_head_dim,
+            self.text.indexer_budget,
+            self.text.indexer_compress_ratio,
+            self.text.ngram_size,
+            self.text.heads_per_ngram,
+            self.text.ngram_vocab_size_base,
+            self.text.make_ngram_vocab_size_divisible_by,
+            self.text.split_ngram_parts,
+            self.text.ple_embed_dim,
+            self.text.ple_conv_kernel_size,
+        )
+        if any(value < 1 for value in dimensions):
+            raise ValueError("architecture dimensions must be positive")
+        if self.text.num_experts_per_tok > self.text.num_experts:
+            raise ValueError("num_experts_per_tok cannot exceed num_experts")
+        if self.text.num_key_value_heads > self.text.num_attention_heads:
+            raise ValueError("num_key_value_heads cannot exceed num_attention_heads")
         rp = self.text.rope_parameters or {}
         self.text.rope_theta = float(rp.get("rope_theta", self.text.rope_theta))
-        self.text.partial_rotary_factor = float(rp.get("partial_rotary_factor", self.text.partial_rotary_factor))
+        self.text.partial_rotary_factor = float(
+            rp.get("partial_rotary_factor", self.text.partial_rotary_factor)
+        )
+        if self.text.full_attention_interval < 1:
+            raise ValueError("full_attention_interval must be positive")
+        if not math.isfinite(self.text.rope_theta) or self.text.rope_theta <= 0:
+            raise ValueError("rope_theta must be finite and positive")
+        if (
+            not math.isfinite(self.text.partial_rotary_factor)
+            or not 0 < self.text.partial_rotary_factor <= 1
+        ):
+            raise ValueError("partial_rotary_factor must be in the interval (0, 1]")
+        rotary_dim = int(self.text.head_dim * self.text.partial_rotary_factor)
+        if rotary_dim < 2 or rotary_dim % 2:
+            raise ValueError("partial rotary dimension must be a positive even number")
+        _first_eos_token(self.text.eos_token_id)
         if not self.text.layer_types:
             self.text.layer_types = [
-                "full_attention" if (i + 1) % self.text.full_attention_interval == 0 else "linear_attention"
+                (
+                    "full_attention"
+                    if (i + 1) % self.text.full_attention_interval == 0
+                    else "linear_attention"
+                )
                 for i in range(self.text.num_hidden_layers)
             ]
+        if len(self.text.layer_types) != self.text.num_hidden_layers:
+            raise ValueError("layer_types must match num_hidden_layers")
+        if any(
+            kind not in {"linear_attention", "full_attention"} for kind in self.text.layer_types
+        ):
+            raise ValueError("layer_types contains an unsupported attention type")
+        if len(set(self.text.ple_layer_ids)) != len(self.text.ple_layer_ids):
+            raise ValueError("ple_layer_ids must not contain duplicates")
+        if len(self.text.ple_layer_ids) != 1:
+            raise ValueError("the streamed runtime requires exactly one PLE layer")
+        if any(
+            layer < 1 or layer > self.text.num_hidden_layers for layer in self.text.ple_layer_ids
+        ):
+            raise ValueError("ple_layer_ids must refer to existing layers")
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
+    def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6):
         super().__init__()
+        if dim < 1 or eps <= 0:
+            raise ValueError("dim must be positive and eps must be positive")
         self.weight = mx.ones(dim)
         self.eps = eps
         self.group_size = group_size
+        if group_size is not None and group_size < 1:
+            raise ValueError("group_size must be positive")
         if group_size is not None and dim % group_size:
             raise ValueError("RMSNorm group size does not divide dimension")
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
             return mx.fast.rms_norm(x, self.weight, self.eps)
         shape = x.shape
@@ -101,11 +187,15 @@ class RMSNorm(nn.Module):
 class RMSNormGated(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6, activation: str = "sigmoid"):
         super().__init__()
+        if dim < 1 or eps <= 0:
+            raise ValueError("dim must be positive and eps must be positive")
         self.weight = mx.ones(dim)
         self.eps = eps
+        if activation not in {"sigmoid", "silu"}:
+            raise ValueError("activation must be sigmoid or silu")
         self.activation = activation
 
-    def __call__(self, x, gate=None):
+    def __call__(self, x: mx.array, gate: mx.array | None = None) -> mx.array:
         out = mx.fast.rms_norm(x, self.weight, self.eps)
         if gate is None:
             return out.astype(x.dtype)
@@ -113,7 +203,7 @@ class RMSNormGated(nn.Module):
         return (act(gate.astype(mx.float32)) * out.astype(mx.float32)).astype(x.dtype)
 
 
-def _rope_partial(x, cos, sin):
+def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
     d = cos.shape[-1]
     cos, sin = cos.astype(x.dtype), sin.astype(x.dtype)
     xr, xp = x[..., :d], x[..., d:]
@@ -123,16 +213,20 @@ def _rope_partial(x, cos, sin):
     return mx.concatenate([xr, xp], axis=-1) if xp.shape[-1] else xr
 
 
-def _l2norm(x, eps=1e-6):
+def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     xf = x.astype(mx.float32)
     return (xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) + eps)).astype(x.dtype)
 
 
 class RotaryEmbedding:
-    def __init__(self, dim, base):
+    def __init__(self, dim: int, base: float):
+        if dim < 2 or dim % 2:
+            raise ValueError("rotary dimension must be a positive even number")
+        if base <= 0:
+            raise ValueError("rotary base must be positive")
         self.inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
 
-    def __call__(self, positions):
+    def __call__(self, positions: mx.array) -> tuple[mx.array, mx.array]:
         freqs = positions.astype(mx.float32)[..., None] * self.inv_freq
         emb = mx.concatenate([freqs, freqs], axis=-1)
         return mx.cos(emb), mx.sin(emb)
@@ -145,9 +239,18 @@ class QSAIndexer(nn.Module):
         self.head_dim = args.indexer_head_dim
         self.token_budget = args.indexer_budget
         self.compress_ratio = args.indexer_compress_ratio
+        if args.indexer_kv_heads != 1:
+            raise ValueError("the streamed QSA indexer requires one key/value head")
+        if self.token_budget < 1 or self.compress_ratio < 1:
+            raise ValueError("indexer budget and compression ratio must be positive")
         self.block_topk = self.token_budget // self.compress_ratio
-        self.index_qk_proj = nn.Linear(args.hidden_size,
-            (args.indexer_n_heads + args.indexer_kv_heads) * args.indexer_head_dim, bias=False)
+        if self.block_topk < 1:
+            raise ValueError("indexer budget must be at least the compression ratio")
+        self.index_qk_proj = nn.Linear(
+            args.hidden_size,
+            (args.indexer_n_heads + args.indexer_kv_heads) * args.indexer_head_dim,
+            bias=False,
+        )
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
@@ -163,8 +266,9 @@ class QSAIndexer(nn.Module):
         if kv_len <= self.token_budget:
             return None
         n_blocks = kv_len // self.compress_ratio
-        pooled = raw_k[:, :n_blocks * self.compress_ratio].reshape(
-            bsz, n_blocks, self.compress_ratio, self.head_dim)
+        pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
+            bsz, n_blocks, self.compress_ratio, self.head_dim
+        )
         pooled = self.k_layernorm(pooled.astype(mx.float32).mean(2).astype(raw_k.dtype))
         starts = mx.arange(n_blocks) * self.compress_ratio
         cos, sin = rope(starts[None])
@@ -199,7 +303,7 @@ class Attention(nn.Module):
         self.n_heads = args.num_attention_heads
         self.n_kv_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         d = args.hidden_size
         self.q_proj = nn.Linear(d, self.n_heads * self.head_dim * 2, bias=False)
         self.k_proj = nn.Linear(d, self.n_kv_heads * self.head_dim, bias=False)
@@ -245,8 +349,14 @@ class GatedDeltaNet(nn.Module):
         self.conv_kernel_size = args.linear_conv_kernel_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
         d = args.hidden_size
-        self.conv1d = nn.Conv1d(self.conv_dim, self.conv_dim, bias=False,
-                                kernel_size=self.conv_kernel_size, groups=self.conv_dim, padding=0)
+        self.conv1d = nn.Conv1d(
+            self.conv_dim,
+            self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=0,
+        )
         self.in_proj_qkv = nn.Linear(d, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(d, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(d, self.n_v, bias=False)
@@ -256,26 +366,37 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(self.dv, args.rms_norm_eps, args.output_gate_type)
         self.out_proj = nn.Linear(self.value_dim, d, bias=False)
 
-    def __call__(self, x, mask, cache):
+    def __call__(self, x, cache):
         bsz, seq, _ = x.shape
         mixed = self.in_proj_qkv(x)
         z = self.in_proj_z(x).reshape(bsz, seq, self.n_v, self.dv)
         b, a = self.in_proj_b(x), self.in_proj_a(x)
-        state = cache[0] if cache is not None and cache[0] is not None else mx.zeros(
-            (bsz, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
-        if mask is not None:
-            mixed = mx.where(mask[..., None], mixed, 0)
+        state = (
+            cache[0]
+            if cache is not None and cache[0] is not None
+            else mx.zeros((bsz, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
+        )
         conv_input = mx.concatenate([state, mixed], 1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1):])
+            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :])
         conv = nn.silu(self.conv1d(conv_input))
         q, k, v = mx.split(conv, [self.key_dim, 2 * self.key_dim], -1)
-        q = _l2norm(q.reshape(bsz, seq, self.n_k, self.dk)) * self.dk ** -0.5
+        q = _l2norm(q.reshape(bsz, seq, self.n_k, self.dk)) * self.dk**-0.5
         k = _l2norm(k.reshape(bsz, seq, self.n_k, self.dk))
         v = v.reshape(bsz, seq, self.n_v, self.dv)
         recurrent = cache[1] if cache is not None else None
-        out, recurrent = gated_delta_update(q, k, v, a, b, self.A_log, self.dt_bias,
-                                             recurrent, mask, use_kernel=not self.training and self.dk >= 32)
+        out, recurrent = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            recurrent,
+            None,
+            use_kernel=not self.training and self.dk >= 32,
+        )
         if cache is not None:
             cache[1] = recurrent
             cache.advance(seq)
@@ -283,20 +404,22 @@ class GatedDeltaNet(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden):
+    def __init__(self, dim: int, hidden: int):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden, bias=False)
         self.up_proj = nn.Linear(dim, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, dim, bias=False)
 
-    def __call__(self, x):
+    def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class StreamedSparseMoeBlock(nn.Module):
-    def __init__(self, args, layer_idx, store):
+    def __init__(self, args: TextArgs, layer_idx: int, store: ExpertStore):
         super().__init__()
         self.top_k = args.num_experts_per_tok
+        if self.top_k < 1 or self.top_k > args.num_experts:
+            raise ValueError("num_experts_per_tok must be between one and num_experts")
         self.layer_idx = layer_idx
         self.store = store
         self.gate = nn.Linear(args.hidden_size, args.num_experts, bias=False)
@@ -305,7 +428,7 @@ class StreamedSparseMoeBlock(nn.Module):
 
     def __call__(self, x):
         logits = self.gate(x.astype(mx.float32))
-        idx = mx.argpartition(-logits, self.top_k - 1, -1)[..., :self.top_k]
+        idx = mx.argpartition(-logits, self.top_k - 1, -1)[..., : self.top_k]
         weights = mx.softmax(mx.take_along_axis(logits, idx, -1), -1, precise=True)
         mx.eval(idx, weights)
         idx_np = np.asarray(idx).reshape(-1, self.top_k)
@@ -329,7 +452,9 @@ class StreamedSparseMoeBlock(nn.Module):
         results = mx.concatenate(routed_results, axis=0)
         slots = mx.put_along_axis(
             mx.zeros((flat_x.shape[0] * self.top_k, x.shape[-1]), dtype=x.dtype),
-            positions[:, None], results, axis=0,
+            positions[:, None],
+            results,
+            axis=0,
         )
         routed = slots.reshape(flat_x.shape[0], self.top_k, -1)
         routed = (routed * weights.reshape(-1, self.top_k)[..., None]).sum(1).reshape(x.shape)
@@ -372,8 +497,10 @@ def _splitmix64(v):
 
 
 def _is_prime(v):
-    if v < 2: return False
-    if v % 2 == 0: return v == 2
+    if v < 2:
+        return False
+    if v % 2 == 0:
+        return v == 2
     return all(v % d for d in range(3, math.isqrt(v) + 1, 2))
 
 
@@ -381,22 +508,35 @@ def _nth_prime_after(start, count):
     p = start
     for _ in range(count):
         p += 1
-        while not _is_prime(p): p += 1
+        while not _is_prime(p):
+            p += 1
     return p
 
 
 class StreamedNGramEmbedding(nn.Module):
-    def __init__(self, args, embed_dim, ple_layer_index, store):
+    def __init__(self, args: TextArgs, ple_layer_index: int, store: PLEStore):
         super().__init__()
         self.store = store
         self.ngram_size = args.ngram_size
         self.heads_per_ngram = args.heads_per_ngram
+        if (
+            ple_layer_index < 0
+            or self.ngram_size < 2
+            or self.heads_per_ngram < 1
+            or args.ngram_vocab_size_base < 2
+        ):
+            raise ValueError("invalid n-gram configuration")
         self.ngram_heads = (args.ngram_size - 1) * args.heads_per_ngram
-        self.eos_token_id = args.eos_token_id[0] if isinstance(args.eos_token_id, list) else args.eos_token_id
-        sizes, offsets, total = [], [], 0
+        self.eos_token_id = _first_eos_token(args.eos_token_id)
+        sizes, offsets = [], []
+        offset = 0
         for h in range(self.ngram_heads):
-            size = _nth_prime_after(args.ngram_vocab_size_base - 1, ple_layer_index * self.ngram_heads + h + 1)
-            sizes.append(size); offsets.append(total); total += size
+            size = _nth_prime_after(
+                args.ngram_vocab_size_base - 1, ple_layer_index * self.ngram_heads + h + 1
+            )
+            sizes.append(size)
+            offsets.append(offset)
+            offset += size
         mults = []
         half = max(1, (((1 << 63) - 1) // max(args.vocab_size, 1)) // 2)
         seed = args.seed + 10007 * ple_layer_index
@@ -407,14 +547,17 @@ class StreamedNGramEmbedding(nn.Module):
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
 
     def _shift_right(self, ids, shift):
-        if shift == 0: return ids
+        if shift == 0:
+            return ids
         bsz, seq = ids.shape
         pos = mx.arange(seq)
         prev_incl = mx.cummax(mx.where(ids == self.eos_token_id, pos, -1), axis=1)
         prev = mx.concatenate([mx.full((bsz, 1), -1, dtype=prev_incl.dtype), prev_incl[:, :-1]], 1)
         src = pos - shift
         gathered = mx.take_along_axis(ids, mx.broadcast_to(mx.maximum(src, 0)[None], (bsz, seq)), 1)
-        return mx.where((pos[None] - (prev + 1) >= shift) & (src[None] >= 0), gathered, self.eos_token_id)
+        return mx.where(
+            (pos[None] - (prev + 1) >= shift) & (src[None] >= 0), gathered, self.eos_token_id
+        )
 
     def indices(self, ids, prev_context):
         n_new = ids.shape[1]
@@ -431,7 +574,7 @@ class StreamedNGramEmbedding(nn.Module):
             blocks.append(gid + self.ngram_heads_offsets[lo:hi].reshape(1, 1, -1))
         return mx.concatenate(blocks, -1)[:, -n_new:]
 
-    def prefetch(self, gid):
+    def prefetch(self, gid: mx.array) -> None:
         self.store.prefetch_rows(gid)
 
     def __call__(self, ids, prev_context, gid=None):
@@ -440,11 +583,11 @@ class StreamedNGramEmbedding(nn.Module):
 
 
 class PLELayer(nn.Module):
-    def __init__(self, args, ple_index, store):
+    def __init__(self, args: TextArgs, ple_index: int, store: PLEStore):
         super().__init__()
         self.d, self.hc = args.hidden_size, args.hc_count
         hc_dim = self.d * self.hc
-        self.ple_embedding = StreamedNGramEmbedding(args, args.ple_embed_dim, ple_index, store)
+        self.ple_embedding = StreamedNGramEmbedding(args, ple_index, store)
         self.dilation = args.ngram_size
         self.short_conv_state_len = (args.ple_conv_kernel_size - 1) * self.dilation
         self.key_proj = nn.Linear(args.ple_embed_dim, hc_dim, bias=False)
@@ -452,15 +595,26 @@ class PLELayer(nn.Module):
         self.norm_key = RMSNorm(hc_dim, self.d, args.rms_norm_eps)
         self.norm_query = RMSNorm(hc_dim, self.d, args.rms_norm_eps)
         self.norm_conv = RMSNorm(hc_dim, self.d, args.rms_norm_eps)
-        self.conv1d = nn.Conv1d(hc_dim, hc_dim, kernel_size=args.ple_conv_kernel_size,
-                                groups=hc_dim, dilation=self.dilation, bias=False)
+        self.conv1d = nn.Conv1d(
+            hc_dim,
+            hc_dim,
+            kernel_size=args.ple_conv_kernel_size,
+            groups=hc_dim,
+            dilation=self.dilation,
+            bias=False,
+        )
 
     def _short_conv(self, x, cache):
         seq, n = x.shape[1], self.short_conv_state_len
-        state = cache[2] if cache is not None and cache[2] is not None else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
+        state = (
+            cache[2]
+            if cache is not None and cache[2] is not None
+            else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
+        )
         full = mx.concatenate([state, x], 1)
-        if cache is not None: cache[2] = mx.contiguous(full[:, -n:])
-        return nn.silu(self.conv1d(full[:, -(n + seq):]))
+        if cache is not None:
+            cache[2] = mx.contiguous(full[:, -n:])
+        return nn.silu(self.conv1d(full[:, -(n + seq) :]))
 
     def __call__(self, hidden, ids, prev_ctx, cache, gid=None):
         emb = self.ple_embedding(ids, prev_ctx, gid).astype(hidden.dtype)
@@ -474,21 +628,28 @@ class PLELayer(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, args, index, experts, ple_store):
+    def __init__(self, args: TextArgs, index: int, experts: ExpertStore, ple_store: PLEStore):
         super().__init__()
         self.layer_type = args.layer_types[index]
-        if self.layer_type == "linear_attention": self.linear_attn = GatedDeltaNet(args)
-        else: self.self_attn = Attention(args)
+        if self.layer_type == "linear_attention":
+            self.linear_attn = GatedDeltaNet(args)
+        else:
+            self.self_attn = Attention(args)
         self.mlp = StreamedSparseMoeBlock(args, index, experts)
         ple_idx = args.ple_layer_ids.index(index + 1) if index + 1 in args.ple_layer_ids else None
         self.ple = PLELayer(args, ple_idx, ple_store) if ple_idx is not None else None
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx, ple_gid=None):
-        if self.ple is not None: h = h + self.ple(h, ids, prev_ctx, cache, ple_gid)
+    def __call__(self, h, rope, mask, cache, idx_cache, ids, prev_ctx, ple_gid=None):
+        if self.ple is not None:
+            h = h + self.ple(h, ids, prev_ctx, cache, ple_gid)
         x, hyper, inject = self.attn_hyper_connection(h)
-        x = self.linear_attn(x, conv_mask, cache) if self.layer_type == "linear_attention" else self.self_attn(x, rope, mask, cache, idx_cache)
+        x = (
+            self.linear_attn(x, cache)
+            if self.layer_type == "linear_attention"
+            else self.self_attn(x, rope, mask, cache, idx_cache)
+        )
         h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
         x, hyper, inject = self.mlp_hyper_connection(h)
         x = self.mlp(x)
@@ -496,86 +657,145 @@ class DecoderLayer(nn.Module):
 
 
 class Qwen4ExpModel(nn.Module):
-    def __init__(self, args, experts, ple_store):
+    def __init__(self, args: TextArgs, experts: ExpertStore, ple_store: PLEStore):
         super().__init__()
         self.args, self.hc = args, args.hc_count
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [DecoderLayer(args, i, experts, ple_store) for i in range(args.num_hidden_layers)]
+        self.layers = [
+            DecoderLayer(args, i, experts, ple_store) for i in range(args.num_hidden_layers)
+        ]
         self.hyper_connection_mixer = GatedResidual(args, False)
-        self.rope = RotaryEmbedding(int(args.head_dim * args.partial_rotary_factor), args.rope_theta)
-        self.ple_layers = [i for i in range(args.num_hidden_layers) if i + 1 in args.ple_layer_ids]
+        self.rope = RotaryEmbedding(
+            int(args.head_dim * args.partial_rotary_factor), args.rope_theta
+        )
+        self.ple_layer = args.ple_layer_ids[0] - 1
 
     def __call__(self, ids, cache=None, input_embeddings=None):
+        if ids.ndim != 2 or ids.shape[0] < 1 or ids.shape[1] < 1:
+            raise ValueError("ids must have shape (batch, sequence) with positive dimensions")
+        if cache is not None and len(cache) != len(self.layers):
+            raise ValueError("cache must contain one state per decoder layer")
         h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
-        if cache is None: cache = [None] * len(self.layers)
-        full = [i for i, layer in enumerate(self.layers) if layer.layer_type != "linear_attention"]
-        attn_cache = cache[full[0]] if full else None
+        if cache is None:
+            cache = [None] * len(self.layers)
+        first_attention = next(
+            (i for i, layer in enumerate(self.layers) if layer.layer_type == "full_attention"), None
+        )
+        attn_cache = cache[first_attention] if first_attention is not None else None
         mask = create_attention_mask(h, [attn_cache] if attn_cache is not None else None)
-        prev_ctx = None
-        ple_gid = None
-        if self.ple_layers:
-            ctx_len = self.args.ngram_size - 1
-            eos = self.args.eos_token_id[0] if isinstance(self.args.eos_token_id, list) else self.args.eos_token_id
-            pc = cache[self.ple_layers[0]]
-            prev = pc[3] if pc is not None else None
-            prev_ctx = prev if prev is not None else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
-            if pc is not None: pc[3] = mx.concatenate([prev_ctx, ids], 1)[:, -ctx_len:]
-            ple_embedding = self.layers[self.ple_layers[0]].ple.ple_embedding
-            ple_gid = ple_embedding.indices(ids, prev_ctx)
-            ple_embedding.prefetch(ple_gid)
+        ctx_len = self.args.ngram_size - 1
+        eos = _first_eos_token(self.args.eos_token_id)
+        pc = cache[self.ple_layer]
+        prev = pc[3] if pc is not None else None
+        prev_ctx = prev if prev is not None else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
+        if pc is not None:
+            pc[3] = mx.concatenate([prev_ctx, ids], 1)[:, -ctx_len:]
+        ple_embedding = self.layers[self.ple_layer].ple.ple_embedding
+        ple_gid = ple_embedding.indices(ids, prev_ctx)
+        ple_embedding.prefetch(ple_gid)
         h = mx.tile(h, (1, 1, self.hc))
-        for layer, state in zip(self.layers, cache):
+        for layer, state in zip(self.layers, cache, strict=True):
             idx_cache = state.indexer if state is not None and hasattr(state, "indexer") else None
-            h = layer(h, self.rope, mask, None, state, idx_cache, ids, prev_ctx, ple_gid)
+            h = layer(h, self.rope, mask, state, idx_cache, ids, prev_ctx, ple_gid)
         return self.hyper_connection_mixer(h)
 
 
 class _IndexerCache(_BaseCache):
-    def __init__(self): self.keys = None
-    def update(self, k): self.keys = k if self.keys is None else mx.concatenate([self.keys, k], 1); return self.keys
+    def __init__(self):
+        self.keys = None
+
+    def update(self, keys):
+        self.keys = keys if self.keys is None else mx.concatenate([self.keys, keys], 1)
+        return self.keys
+
     @property
-    def state(self): return self.keys
+    def state(self):
+        return self.keys
+
     @state.setter
-    def state(self, value): self.keys = value
+    def state(self, value):
+        self.keys = value
 
 
 class _AttnCache(KVCache):
-    def __init__(self): super().__init__(); self.indexer = _IndexerCache()
+    def __init__(self):
+        super().__init__()
+        self.indexer = _IndexerCache()
 
 
 class Model(nn.Module):
-    CENTERED_NORMS = ("hc_norm.weight", "q_norm.weight", "k_norm.weight",
-        "indexer.q_layernorm.weight", "indexer.k_layernorm.weight",
-        "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight")
+    CENTERED_NORMS = (
+        "hc_norm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
+        "indexer.q_layernorm.weight",
+        "indexer.k_layernorm.weight",
+        "ple.norm_key.weight",
+        "ple.norm_query.weight",
+        "ple.norm_conv.weight",
+    )
 
-    def __init__(self, args, expert_store, ple_store):
+    def __init__(self, args: ModelArgs, expert_store: ExpertStore, ple_store: PLEStore):
         super().__init__()
         self.args, self.model_type = args, args.model_type
         self.expert_store, self.ple_store = expert_store, ple_store
+        self.load_stats: dict[str, int] = {}
         self.model = Qwen4ExpModel(args.text, expert_store, ple_store)
         if not args.text.tie_word_embeddings:
             self.lm_head = nn.Linear(args.text.hidden_size, args.text.vocab_size, bias=False)
 
     def __call__(self, inputs, cache=None, input_embeddings=None):
         out = self.model(inputs, cache, input_embeddings)
-        return self.model.embed_tokens.as_linear(out) if self.args.text.tie_word_embeddings else self.lm_head(out)
+        if self.args.text.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        return self.lm_head(out)
 
     @property
-    def layers(self): return self.model.layers
+    def layers(self):
+        return self.model.layers
 
     def make_cache(self):
-        return [_AttnCache() if kind != "linear_attention" else ArraysCache(4) for kind in self.args.text.layer_types]
+        return [
+            _AttnCache() if kind == "full_attention" else ArraysCache(4)
+            for kind in self.args.text.layer_types
+        ]
 
-    def sanitize(self, weights):
-        raw = any(k.startswith("model.language_model.") for k in weights) or any(k.endswith("mlp.experts.gate_up_proj") for k in weights)
+    @staticmethod
+    def _normalize_weight_name(name: str) -> str:
+        if name.startswith("model.language_model."):
+            return "model." + name[len("model.language_model.") :]
+        if name.startswith("language_model."):
+            return name[len("language_model.") :]
+        return name
+
+    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+        raw = any(name.startswith("model.language_model.") for name in weights) or any(
+            name.endswith("mlp.experts.gate_up_proj") for name in weights
+        )
         out = {}
-        for key, value in weights.items():
-            if key.startswith("mtp.") or key.startswith("vision_tower.") or key.startswith("model.visual."): continue
-            if key.startswith("language_model."): key = key[len("language_model."):]
-            if key.startswith("model.language_model."): key = "model." + key[len("model.language_model."):]
-            if key.endswith(".mlp.experts.gate_up_proj") or key.endswith(".mlp.experts.down_proj"): continue
-            if "conv1d.weight" in key and value.ndim == 3 and value.shape[1] == 1 and value.shape[-1] != 1:
+        for name, value in weights.items():
+            if (
+                name.startswith("mtp.")
+                or name.startswith("vision_tower.")
+                or name.startswith("model.visual.")
+            ):
+                continue
+            key = self._normalize_weight_name(name)
+            if key.endswith((".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")):
+                continue
+            if (
+                "conv1d.weight" in key
+                and value.ndim == 3
+                and value.shape[1] == 1
+                and value.shape[-1] != 1
+            ):
                 value = value.transpose(0, 2, 1)
-            if raw and key.endswith(self.CENTERED_NORMS): value = value + 1.0
+            if raw and key.endswith(self.CENTERED_NORMS):
+                value = value + 1.0
             out[key] = value
         return out
+
+    def close(self) -> None:
+        self.expert_store.close()
+        self.ple_store.close()
+        self.expert_store.index.close()
