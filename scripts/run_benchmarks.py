@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import platform
 import shutil
 import subprocess
@@ -19,6 +20,27 @@ PROMPTS = {
     "medium": BASE * 4,
     "long": BASE * 12,
 }
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be nonnegative")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a finite positive number")
+    return parsed
 
 
 def _sysctl(name: str) -> str:
@@ -91,15 +113,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, default=MODEL)
     parser.add_argument("--output", type=Path, default=Path("artifacts/benchmark_results.json"))
-    parser.add_argument("--max-tokens", type=int, default=4)
-    parser.add_argument("--runs", type=int, default=2)
-    parser.add_argument("--expert-budget-gib", type=float, default=8.0)
-    parser.add_argument("--ple-budget-gib", type=float, default=1.0)
-    parser.add_argument("--mlx-cache-gib", type=float, default=1.0)
-    parser.add_argument("--mlx-memory-gib", type=float, default=28.0)
-    parser.add_argument("--io-workers", type=int, default=6)
-    parser.add_argument("--expert-prefetch", type=int, default=2)
-    parser.add_argument("--ple-prefetch", type=int, default=8)
+    parser.add_argument("--max-tokens", type=_nonnegative_int, default=4)
+    parser.add_argument("--runs", type=_positive_int, default=2)
+    parser.add_argument("--expert-budget-gib", type=_positive_float, default=8.0)
+    parser.add_argument("--ple-budget-gib", type=_positive_float, default=1.0)
+    parser.add_argument("--mlx-cache-gib", type=_positive_float, default=1.0)
+    parser.add_argument("--mlx-memory-gib", type=_positive_float, default=28.0)
+    parser.add_argument("--io-workers", type=_positive_int, default=6)
+    parser.add_argument("--expert-prefetch", type=_nonnegative_int, default=2)
+    parser.add_argument("--ple-prefetch", type=_nonnegative_int, default=8)
     args = parser.parse_args()
     result = {
         "system": system_snapshot(),

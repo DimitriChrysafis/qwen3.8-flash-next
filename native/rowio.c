@@ -114,6 +114,7 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
         return PyErr_NoMemory();
     }
 
+    int sorted = 1;
     for (Py_ssize_t i = 0; i < count; ++i) {
         PyObject *item = PySequence_Fast_GET_ITEM(rows, i);
         int overflow = 0;
@@ -134,9 +135,44 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
         }
         requests[i].row = (uint64_t)value;
         requests[i].output_index = i;
+        if (i > 0 && requests[i - 1].row > requests[i].row) {
+            sorted = 0;
+        }
     }
     Py_DECREF(rows);
-    qsort(requests, (size_t)count, sizeof(*requests), compare_rows);
+    if (!sorted) {
+        Py_BEGIN_ALLOW_THREADS
+        qsort(requests, (size_t)count, sizeof(*requests), compare_rows);
+        Py_END_ALLOW_THREADS
+    }
+
+    size_t max_block_size = 0;
+    Py_ssize_t start = 0;
+    while (start < count) {
+        Py_ssize_t end = start + 1;
+        while (end < count &&
+               (requests[end].row == requests[end - 1].row ||
+                requests[end].row == requests[end - 1].row + 1)) {
+            ++end;
+        }
+        Py_ssize_t unique_rows = 1;
+        for (Py_ssize_t i = start + 1; i < end; ++i) {
+            if (requests[i].row != requests[i - 1].row) {
+                ++unique_rows;
+            }
+        }
+        if (row_bytes != 0 &&
+            (size_t)unique_rows > SIZE_MAX / (size_t)row_bytes) {
+            PyMem_Free(requests);
+            PyErr_SetString(PyExc_OverflowError, "requested row data is too large");
+            return NULL;
+        }
+        size_t block_size = (size_t)unique_rows * (size_t)row_bytes;
+        if (block_size > max_block_size) {
+            max_block_size = block_size;
+        }
+        start = end;
+    }
 
     PyObject *output = PyBytes_FromStringAndSize(NULL, output_size);
     if (output == NULL) {
@@ -148,9 +184,15 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
     unsigned long long pread_calls = 0;
     int read_errno = 0;
     int failed = 0;
+    char *block = malloc(max_block_size == 0 ? 1 : max_block_size);
+    if (block == NULL) {
+        Py_DECREF(output);
+        PyMem_Free(requests);
+        return PyErr_NoMemory();
+    }
 
     Py_BEGIN_ALLOW_THREADS
-    Py_ssize_t start = 0;
+    start = 0;
     while (start < count) {
         Py_ssize_t end = start + 1;
         while (end < count &&
@@ -165,23 +207,10 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
                 ++unique_rows;
             }
         }
-        if (row_bytes != 0 &&
-            (size_t)unique_rows > SIZE_MAX / (size_t)row_bytes) {
-            read_errno = EOVERFLOW;
-            failed = 1;
-            break;
-        }
         size_t block_size = (size_t)unique_rows * (size_t)row_bytes;
-        char *block = malloc(block_size == 0 ? 1 : block_size);
-        if (block == NULL) {
-            read_errno = ENOMEM;
-            failed = 1;
-            break;
-        }
         uint64_t offset = 0;
         if (!checked_offset(base_offset, requests[start].row,
                             (uint64_t)row_bytes, &offset)) {
-            free(block);
             read_errno = EOVERFLOW;
             failed = 1;
             break;
@@ -189,7 +218,6 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
         if (row_bytes != 0 &&
             !read_fully(fd, block, block_size, offset, &pread_calls,
                         &read_errno)) {
-            free(block);
             failed = 1;
             break;
         }
@@ -202,11 +230,11 @@ static PyObject *read_rows(PyObject *Py_UNUSED(module), PyObject *args) {
             memcpy(output_buffer + requests[i].output_index * row_bytes,
                    block + row_delta * (uint64_t)row_bytes, (size_t)row_bytes);
         }
-        free(block);
         start = end;
     }
     Py_END_ALLOW_THREADS
 
+    free(block);
     PyMem_Free(requests);
     if (failed) {
         Py_DECREF(output);

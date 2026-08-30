@@ -39,7 +39,7 @@ It decoded at 1.58 token/s, used 6.81 GiB peak RSS and 11.23 GiB peak MLX memory
 ## Implementation
 
 - Safetensors headers are indexed without loading tensor payloads. `os.pread` fetches only selected expert slices and n-gram rows.
-- A small optional CPython C extension performs contiguous row reads without holding the GIL; the validated Python reader remains available as a fallback.
+- A small optional CPython C extension performs contiguous row reads without holding the GIL, skips sorting already ordered requests, and reuses its largest range buffer; the validated Python reader remains available as a fallback.
 - Every MoE layer runs its BF16 router, loads the selected top-10 experts asynchronously, executes their 4-bit Metal matmuls, and updates a byte-bounded adaptive LFU/LRU cache.
 - Route frequencies and transitions drive expert prefetch. Entries support hot and pinned states.
 - The 320,001,536-row n-gram table remains on SSD. The exact 16 rows required by known input tokens are prefetched before layer 1 and overlap layer 0 compute.
@@ -66,27 +66,19 @@ Measured result: `29 passed`. A generated tiny Qwen4Exp checkpoint is compared d
 ## Benchmarks
 
 ```bash
-.venv/bin/python scripts/run_benchmarks.py --max-tokens 4 --runs 2
+.venv/bin/python scripts/run_benchmarks.py --max-tokens 4 --runs 5
 ```
 
-Measured on 2026-08-29 with an Apple M3 Max (14 CPU cores, 30 GPU cores), 36 GB unified RAM, internal Apple NVMe, macOS 27.0, MLX 0.32.2, and an 8 GiB expert cache. Each first run used a new process; the macOS filesystem cache was not forcibly cleared. Decode throughput excludes the first token. Every case generated four tokens.
+Measured on 2026-08-30 with an Apple M3 Max (14 CPU cores, 30 GPU cores), 36 GB unified RAM, internal Apple NVMe, macOS 27.0, MLX 0.32.2, and an 8 GiB expert cache. Each prompt case used a fresh process and five runs; the macOS filesystem cache was not forcibly cleared. Values below are medians across the five runs. Decode throughput excludes the first token. Every case generated four tokens.
 
-### First run
+| Prompt | Tokens | TTFT | Prefill | Decode | Peak RSS | Peak MLX | Disk read (cumulative) | I/O wait (cumulative) | Expert prefetch | PLE prefetch |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Short | 11 | 0.382 s | 28.82 tok/s | 15.04 tok/s | 4.24 GiB | 11.21 GiB | 10.56 GiB | 10.32 s | 0.00% | 100% |
+| Medium | 122 | 15.818 s | 7.71 tok/s | 1.38 tok/s | 2.81 GiB | 11.64 GiB | 66.80 GiB | 92.58 s | 8.94% | 100% |
+| Long | 362 | 20.661 s | 17.52 tok/s | 1.13 tok/s | 3.49 GiB | 12.36 GiB | 91.41 GiB | 126.40 s | 9.99% | 100% |
 
-| Prompt | Tokens | Init | TTFT | Prefill | Decode | Avg RSS | Peak RSS | Peak MLX | Disk read | I/O wait | Expert hit | PLE prefetch |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Short | 11 | 0.456 s | 2.884 s | 3.82 tok/s | 1.52 tok/s | 4.25 GiB | 7.62 GiB | 10.93 GiB | 7.79 GiB | 1.95 s | 22.97% | 100% |
-| Medium | 122 | 0.483 s | 20.591 s | 5.93 tok/s | 0.76 tok/s | 2.71 GiB | 8.06 GiB | 11.52 GiB | 24.72 GiB | 4.89 s | 5.16% | 100% |
-| Long | 362 | 0.522 s | 30.637 s | 11.82 tok/s | 0.72 tok/s | 2.51 GiB | 7.60 GiB | 12.21 GiB | 32.19 GiB | 5.84 s | 3.80% | 100% |
+Per-run disk reads for the first and subsequent runs were 8.01/0.00 GiB for short, 24.56/20.65 GiB for medium, and 32.52/29.11 GiB for long, where the second value is the median of runs two through five.
 
-### Repeated same prompt, same process
-
-| Prompt | TTFT | Prefill | Decode | Peak RSS | Additional disk read | Expert hit |
-|---|---:|---:|---:|---:|---:|---:|
-| Short | 1.256 s | 8.76 tok/s | 6.69 tok/s | 2.63 GiB | 0 GiB | 100% |
-| Medium | 26.016 s | 4.69 tok/s | 0.99 tok/s | 4.31 GiB | 21.98 GiB | 14.55% |
-| Long | 36.235 s | 9.99 tok/s | 0.92 tok/s | 3.82 GiB | 29.61 GiB | 10.44% |
-
-The full JSON report is written to `artifacts/benchmark_results.json`. The 8 GiB cache retains every expert used by the short prompt, producing a zero-read second run. Medium and long prompts route through more experts than the cache can retain and remain SSD-bound.
+The full JSON report is written to `artifacts/benchmark_results.json`. The short case reached zero additional disk reads on its final three runs. Medium and long prompts route through more experts than the cache can retain and remain SSD-bound.
 
 A current `llama.cpp` GGUF fallback was also exercised with CPU-mapped experts and n-gram weights. One real IQ1_S token required 90.86 seconds end-to-end, reached 19.57 GiB RSS, and processed the prompt at 3.7 token/s. The streamed MLX path is the practical implementation on this machine.
