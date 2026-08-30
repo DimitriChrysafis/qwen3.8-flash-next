@@ -39,6 +39,7 @@ It decoded at 1.58 token/s, used 6.81 GiB peak RSS and 11.23 GiB peak MLX memory
 ## Implementation
 
 - Safetensors headers are indexed without loading tensor payloads. `os.pread` fetches only selected expert slices and n-gram rows.
+- A small optional CPython C extension performs contiguous row reads without holding the GIL; the validated Python reader remains available as a fallback.
 - Every MoE layer runs its BF16 router, loads the selected top-10 experts asynchronously, executes their 4-bit Metal matmuls, and updates a byte-bounded adaptive LFU/LRU cache.
 - Route frequencies and transitions drive expert prefetch. Entries support hot and pinned states.
 - The 320,001,536-row n-gram table remains on SSD. The exact 16 rows required by known input tokens are prefetched before layer 1 and overlap layer 0 compute.

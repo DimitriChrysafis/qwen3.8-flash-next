@@ -15,6 +15,11 @@ from typing import Iterable
 import mlx.core as mx
 import numpy as np
 
+try:
+    from . import _rowio
+except ImportError:
+    _rowio = None
+
 
 _DTYPES = {
     "BOOL": (np.bool_, 1), "U8": (np.uint8, 1), "I8": (np.int8, 1),
@@ -151,6 +156,18 @@ class SafeTensorIndex:
             return np.empty((0, *info.shape[1:]), dtype=_DTYPES[info.dtype][0])
         if min(requested) < 0 or max(requested) >= info.shape[0]:
             raise IndexError(f"row outside {name} shape {info.shape}")
+        if _rowio is not None:
+            started = time.perf_counter()
+            data, pread_calls, bytes_read = _rowio.read_rows(
+                self._fd(info.path), info.offset, info.row_bytes, requested, info.shape[0])
+            elapsed = time.perf_counter() - started
+            with self._lock:
+                self.stats.pread_calls += pread_calls
+                self.stats.bytes_read += bytes_read
+                self.stats.requested_bytes += bytes_read
+                self.stats.read_seconds += elapsed
+                self.stats.rows_read += len(requested)
+            return self._numpy(data, info.dtype, (len(requested), *info.shape[1:]))
         unique = sorted(set(requested))
         raw: dict[int, bytes] = {}
         start = prev = unique[0]

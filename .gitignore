@@ -1,4 +1,8 @@
 __pycache__/
+build/
+*.so
+*.dylib
+*.pyd
 *.egg-info/
 .venv/
 artifacts/benchmark_results.json

@@ -59,6 +59,21 @@ def test_header_and_exact_row_ranges(tmp_path):
     index.close()
 
 
+def test_row_reads_restore_order_and_deduplicate(tmp_path):
+    _, _ = tiny_file(tmp_path)
+    index = SafeTensorIndex(tmp_path)
+    name = "model.layers.0.mlp.switch_mlp.gate_proj.weight"
+    info = index.tensors[name]
+    rows = index.read_rows_numpy(name, [3, 1, 3, 2])
+    expected = rows[[1, 3, 0]]
+    np.testing.assert_array_equal(rows, expected[[2, 0, 2, 1]])
+    stats = index.snapshot()
+    assert stats["bytes_read"] == 3 * info.row_bytes
+    assert stats["pread_calls"] == 1
+    assert stats["rows_read"] == 4
+    index.close()
+
+
 def test_expert_slice_dequant_cache_and_prefetch(tmp_path):
     experts, _ = tiny_file(tmp_path)
     index = SafeTensorIndex(tmp_path, workers=3)
