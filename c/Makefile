@@ -13,7 +13,7 @@ $(OBJDIR):
 $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-TESTS = test_json test_safetensors test_reader test_cache
+TESTS = test_json test_safetensors test_reader test_cache test_kernel
 
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
