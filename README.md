@@ -2,10 +2,6 @@
 
 colibri runs qwen3.8-flash-next on apple silicon with mlx while routed experts and the n-gram table stay on ssd. the hot path combines sparse routing, asynchronous reads, adaptive caching, and metal matmul.
 
-![colibri runtime architecture](docs/architecture.svg)
-
-![colibri token inference loop](docs/inference-loop.svg)
-
 ## benchmark
 
 five runs per prompt, four generated tokens, m3 max, 36 gb unified memory, mlx 0.32.2, 8 gib expert cache. medians are shown; each prompt used a fresh process and the filesystem cache was not cleared.
