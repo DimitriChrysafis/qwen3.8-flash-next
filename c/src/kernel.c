@@ -20,15 +20,17 @@ void kernel_rmsnorm(const float *x, const float *w, size_t n, float eps,
 }
 
 void kernel_rmsnorm_grouped(const float *x, const float *w, size_t n,
-                            size_t group, float eps, float *y) {
+                            size_t group, size_t rows, float eps, float *y) {
     size_t groups = n / group;
+    size_t groups_per_row = rows ? groups / rows : groups;
     for (size_t g = 0; g < groups; g++) {
         const float *xg = x + g * group;
         float ss = 0;
         for (size_t i = 0; i < group; i++) ss += xg[i] * xg[i];
         float r = 1.0f / sqrtf(ss / (float)group + eps);
+        const float *wg = w ? w + (g % groups_per_row) * group : NULL;
         for (size_t i = 0; i < group; i++) {
-            y[g * group + i] = xg[i] * r * (w ? w[g * group + i] : 1.0f);
+            y[g * group + i] = xg[i] * r * (wg ? wg[i] : 1.0f);
         }
     }
 }
@@ -289,14 +291,14 @@ void gemm_q4(int M, int N, int K, const float *A, const uint32_t *W,
 }
 
 void kernel_conv1d_depthwise(const float *x, size_t seq, size_t ch,
-                             const float *w, size_t k, size_t d, float *y) {
+                             const uint16_t *w, size_t k, size_t d, float *y) {
     for (size_t t = 0; t < seq; t++) {
         for (size_t c = 0; c < ch; c++) {
             float acc = 0;
             for (size_t i = 0; i < k; i++) {
                 // tap i covers position t - (k-1-i)*d
                 size_t src = (size_t)((long long)t - (long long)(k - 1 - i) * (long long)d);
-                if (src < seq) acc += x[src * ch + c] * w[c * k + i];
+                if (src < seq) acc += x[src * ch + c] * bf16_to_f32(w[c * k + i]);
             }
             y[t * ch + c] = acc;
         }

@@ -28,14 +28,14 @@ static void test_rmsnorm(void) {
     float r = 1.0f / sqrtf(ss / 257.0f + 1e-6f);
     for (int i = 0; i < 257; i++) ref[i] = x[i] * r * w[i];
     for (int i = 0; i < 257; i++) CHECK(close_enough(y[i], ref[i], 1e-6f));
-    // grouped
-    kernel_rmsnorm_grouped(x, w, 256, 64, 1e-6f, y);
-    for (int g = 0; g < 4; g++) {
+    // grouped: 4 rows x 2 groups of 64, weight [128] broadcast over rows
+    kernel_rmsnorm_grouped(x, w, 512, 64, 4, 1e-6f, y);
+    for (int g = 0; g < 8; g++) {
         float gss = 0;
         for (int i = 0; i < 64; i++) gss += x[g * 64 + i] * x[g * 64 + i];
         float gr = 1.0f / sqrtf(gss / 64.0f + 1e-6f);
         for (int i = 0; i < 64; i++) {
-            CHECK(close_enough(y[g * 64 + i], x[g * 64 + i] * gr * w[g * 64 + i], 1e-6f));
+            CHECK(close_enough(y[g * 64 + i], x[g * 64 + i] * gr * w[(g % 2) * 64 + i], 1e-6f));
         }
     }
 }
@@ -271,16 +271,21 @@ static void test_gemm_q4(void) {
 static void test_conv1d(void) {
     uint64_t st = 41;
     enum { SEQ = 9, CH = 5, K = 4, D = 3 };
-    float x[SEQ * CH], w[CH * K], y[SEQ * CH], ref[SEQ * CH];
+    float x[SEQ * CH], wf[CH * K], y[SEQ * CH], ref[SEQ * CH];
+    uint16_t w[CH * K];
     for (int i = 0; i < SEQ * CH; i++) x[i] = frand(&st);
-    for (int i = 0; i < CH * K; i++) w[i] = frand(&st);
+    for (int i = 0; i < CH * K; i++) {
+        wf[i] = frand(&st);
+        w[i] = f32_to_bf16(wf[i]);
+    }
     kernel_conv1d_depthwise(x, SEQ, CH, w, K, D, y);
     for (int t = 0; t < SEQ; t++)
         for (int c = 0; c < CH; c++) {
             float acc = 0;
             for (int i = 0; i < K; i++) {
                 long long src = (long long)t - (long long)(K - 1 - i) * D;
-                if (src >= 0 && src < SEQ) acc += x[src * CH + c] * w[c * K + i];
+                if (src >= 0 && src < SEQ)
+                    acc += x[src * CH + c] * bf16_to_f32(w[c * K + i]);
             }
             ref[t * CH + c] = acc;
         }

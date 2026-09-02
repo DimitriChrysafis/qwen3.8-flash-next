@@ -10,10 +10,11 @@
 void kernel_rmsnorm(const float *x, const float *w, size_t n, float eps,
                     float *y);
 
-// grouped rmsnorm: x has shape [n] conceptually split into groups of `group`
-// elements; each group normalized independently then scaled by w (n weights)
+// grouped rmsnorm: x has [rows * groups_per_row * group] elements; each group
+// is normalized independently. w holds groups_per_row * group weights that
+// are broadcast across rows (indexed by group and element, not by row).
 void kernel_rmsnorm_grouped(const float *x, const float *w, size_t n,
-                            size_t group, float eps, float *y);
+                            size_t group, size_t rows, float eps, float *y);
 
 void kernel_silu(const float *x, size_t n, float *y);
 void kernel_sigmoid(const float *x, size_t n, float *y);
@@ -67,9 +68,9 @@ void gemm_q4(int M, int N, int K, const float *A, const uint32_t *W,
 // ---- conv ----
 
 // depthwise conv1d, groups = channels, kernel k, dilation d.
-// x: [seq, ch]; w: [ch, k] (one weight per channel per tap); out: [seq, ch]
-// output[t] = sum_{i=0}^{k-1} w[c][i] * x[t - (k-1-i)*d], zero-padded
+// x: [seq, ch]; w: [ch, k] bf16 (one weight per channel per tap);
+// out: [seq, ch]; output[t] = sum_{i=0}^{k-1} w[c][i] * x[t - (k-1-i)*d]
 void kernel_conv1d_depthwise(const float *x, size_t seq, size_t ch,
-                             const float *w, size_t k, size_t d, float *y);
+                             const uint16_t *w, size_t k, size_t d, float *y);
 
 #endif

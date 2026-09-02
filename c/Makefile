@@ -13,10 +13,14 @@ $(OBJDIR):
 $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-TESTS = test_json test_safetensors test_reader test_cache test_kernel
+TESTS = test_json test_safetensors test_reader test_cache test_kernel test_model
 
 test: $(TESTS)
 	@for t in $(TESTS); do ./$$t || exit 1; done
+
+# tiny-model parity against the colibri reference (needs python mlx + mlx-lm)
+parity: test_model
+	@python3 tests/gen_tiny.py /tmp/qwen_tiny ./test_model
 
 test_%: tests/test_%.c $(ALLOBJ) | $(OBJDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(ALLOBJ) $(LDLIBS)
