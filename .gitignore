@@ -6,3 +6,6 @@ build/
 *.egg-info/
 .venv/
 artifacts/benchmark_results.json
+
+# c runtime build
+c/test_*
