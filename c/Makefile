@@ -3,6 +3,7 @@ CFLAGS ?= -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -I.
 LDLIBS = -framework Accelerate
 
 OBJDIR = build
+ALLOBJ = $(patsubst src/%.c,$(OBJDIR)/%.o,$(wildcard src/*.c))
 
 all:
 
@@ -12,13 +13,15 @@ $(OBJDIR):
 $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test: test_json
-	@for t in test_json; do ./$$t || exit 1; done
+TESTS = test_json test_safetensors test_reader
 
-test_%: tests/test_%.c $(OBJDIR)/%.o | $(OBJDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(OBJDIR)/$*.o $(LDLIBS)
+test: $(TESTS)
+	@for t in $(TESTS); do ./$$t || exit 1; done
+
+test_%: tests/test_%.c $(ALLOBJ) | $(OBJDIR)
+	$(CC) $(CFLAGS) -o $@ $< $(ALLOBJ) $(LDLIBS)
 
 clean:
-	rm -rf $(OBJDIR) test_json
+	rm -rf $(OBJDIR) $(TESTS)
 
 .PHONY: all test clean
