@@ -15,23 +15,32 @@
   geometry, prefill + incremental decode
 - tiny-model parity vs colibri: 100% argmax agreement, self-consistency 3e-7
 - cli: generate + benchmark, greedy/temperature/top-p sampling
+- byte-level bpe tokenizer: loads the real 12.8 mb tokenizer.json in ~0.2 s,
+  byte-to-unicode table, qwen3 pretokenization (icu classes), added tokens +
+  eos, encode matches the hf reference exactly on ascii/unicode/emoji,
+  decode wired into the cli
+- benchmark --runs loop (reset caches between runs, averaged stats)
+- real model end to end (pipenetwork 4bit dir): fixed language_model. prefix
+  lookup, bf16 scales in row dequant, 3d expert block dequant, packed q4
+  gemm dims, ple shard routing (rows per shard from the shard shape, not
+  total/split), ple projector group size, ple scratch overflow, mwset
+  pointer stability, cache value leaks. layer 0-2 hidden states match the
+  colibri reference to 4 decimals; top-1 logits agree
 
 ## next (correctness)
 
-- [ ] tokenizer: load fails on the real tokenizer.json (12.8 mb, 248k vocab).
-      "tok: load start" prints, then load failed. likely the merges pass or a
-      key > 512 bytes. debug with prints, then wire encode/decode into the cli
-      (generate currently prints raw ids)
-- [ ] run the real model end to end (pipenetwork 4bit dir) and sanity check
-      generated text
+- [ ] real-model numerical parity: c runs f32 activations vs colibri bf16;
+      per-layer diffs grow through expert-routing flips (corr 0.999 at
+      layer 2, 0.67 on final logits). decide whether to match bf16 rounding
+      per op or accept the drift; compare moe routes given identical inputs
+- [ ] special-token aware encode (split text on added_tokens before bpe) so
+      --prompt can carry <|im_start|> etc.
+- [ ] chat template support (--chat flag is a no-op)
 - [ ] benchmark the real model and update README numbers
-- [ ] benchmark command ignores --runs; make it loop
-- [ ] clean the leftover debug dump code in tests/gen_tiny.py (the per-layer
-      bisection dumps) and any stray blank lines in src/model.c
 - [ ] remove the python runtime (src/colibri_runtime, tests/, scripts/,
       pyproject.toml, setup.py, native/) once parity is captured in a script
-      that does not need it
-- [ ] chat template support (--chat flag is a no-op)
+      that does not need it; tests/gen_tiny.py is already gone but the
+      makefile parity target still references it
 
 ## later (speed)
 
@@ -48,8 +57,12 @@
       consider a dequantized fp32 path for always-hot layers
 - [ ] profile with instruments: find where decode time actually goes on the
       real model (ssd vs gemm vs attention)
+- [ ] tokenizer encode is o(n) per merge per pre-token; fine for prompts,
+      switch to a heap if long-prefill throughput ever matters
 
 ## misc
 
 - [ ] fallclasses repo push still fails with http 408 on this network; retry
       later or push from a copy outside icloud drive
+- [ ] memory: the real model wants ~11 gib dense + expert cache; on a 36 gb
+      machine close apps first or the jetsam killer sigkills the run
