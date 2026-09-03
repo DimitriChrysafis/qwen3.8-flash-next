@@ -303,7 +303,7 @@ void st_index_close(st_index *ix) {
     memset(ix, 0, sizeof(*ix));
 }
 
-st_tensor *st_find(st_index *ix, const char *name) {
+static st_tensor *st_find_exact(st_index *ix, const char *name) {
     // binary search over sorted names
     size_t lo = 0, hi = ix->ntensors;
     while (lo < hi) {
@@ -314,6 +314,15 @@ st_tensor *st_find(st_index *ix, const char *name) {
         else hi = mid;
     }
     return NULL;
+}
+
+st_tensor *st_find(st_index *ix, const char *name) {
+    st_tensor *t = st_find_exact(ix, name);
+    if (t || strncmp(name, "model.", 6) != 0) return t;
+    // multimodal checkpoints nest the text model under "language_model."
+    char prefixed[512];
+    snprintf(prefixed, sizeof(prefixed), "language_model.%s", name);
+    return st_find_exact(ix, prefixed);
 }
 
 int st_read_tensor(st_index *ix, st_tensor *t, void *out, err_t *err) {

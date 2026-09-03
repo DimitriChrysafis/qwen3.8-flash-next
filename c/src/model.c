@@ -160,36 +160,47 @@ typedef struct {
 } mweight;
 
 typedef struct {
-    mweight *items;
+    mweight **items; // stable element pointers; weights are handed out as
+                     // mweight * and must not move after mw_find
     size_t n, cap;
 } mwset;
 
 static mweight *mw_add(mwset *s, const char *name) {
     if (s->n == s->cap) {
         s->cap = s->cap ? s->cap * 2 : 64;
-        s->items = xrealloc(s->items, s->cap * sizeof(mweight));
+        s->items = xrealloc(s->items, s->cap * sizeof(mweight *));
     }
-    mweight *w = &s->items[s->n++];
-    memset(w, 0, sizeof(*w));
+    mweight *w = xcalloc(1, sizeof(mweight));
+    s->items[s->n++] = w;
     snprintf(w->name, sizeof(w->name), "%s", name);
     return w;
+}
+
+static mweight *mw_find(mwset *s, const char *name) {
+    for (size_t i = 0; i < s->n; i++) {
+        if (strcmp(s->items[i]->name, name) == 0) return s->items[i];
+    }
+    return NULL;
 }
 
 // linear layer dispatch: q4 weights use the packed gemm, bf16 use bnns
 static void linear_forward(mweight *w, int M, int N, int K, const float *A,
                            float *C, int group_size) {
     if (w->is_q4) {
+        K = (int)w->cols * 8; // packed q4: shape[1] counts u32 words
         gemm_q4(M, N, K, A, w->q, w->scales, w->biases, group_size, C);
     } else {
         gemm_bf16(M, N, K, A, w->bf16, C);
     }
 }
 
-static mweight *mw_find(mwset *s, const char *name) {
-    for (size_t i = 0; i < s->n; i++) {
-        if (strcmp(s->items[i].name, name) == 0) return &s->items[i];
-    }
-    return NULL;
+// quantized checkpoints keep scales/biases beside the weight without the
+// ".weight" suffix ("<base>.weight" -> "<base>.scales")
+static void side_name(char *out, size_t cap, const char *weight_name,
+                      const char *suffix) {
+    size_t n = strlen(weight_name);
+    if (n > 7 && strcmp(weight_name + n - 7, ".weight") == 0) n -= 7;
+    snprintf(out, cap, "%.*s.%s", (int)n, weight_name, suffix);
 }
 
 // load a tensor into a mweight (q4 if scales exist, else bf16). scales and
@@ -210,8 +221,8 @@ static int mw_load(mwset *s, st_index *ix, const char *name, err_t *err) {
     w->rows = t->shape[0];
     w->cols = t->shape[1];
     char sn[512], bn[512];
-    snprintf(sn, sizeof(sn), "%s.scales", name);
-    snprintf(bn, sizeof(bn), "%s.biases", name);
+    side_name(sn, sizeof(sn), name, "scales");
+    side_name(bn, sizeof(bn), name, "biases");
     st_tensor *st_scales = st_find(ix, sn);
     st_tensor *st_biases = st_find(ix, bn);
     if (st_scales) {
@@ -360,10 +371,11 @@ void model_free(qmodel *m) {
     free(m->ng_offsets);
     free(m->ng_sizes);
     for (size_t i = 0; i < m->mw.n; i++) {
-        free((void *)m->mw.items[i].bf16);
-        free((void *)m->mw.items[i].q);
-        free(m->mw.items[i].scales);
-        free(m->mw.items[i].biases);
+        free((void *)m->mw.items[i]->bf16);
+        free((void *)m->mw.items[i]->q);
+        free(m->mw.items[i]->scales);
+        free(m->mw.items[i]->biases);
+        free(m->mw.items[i]);
     }
     free(m->mw.items);
     cache_destroy(&m->expert_cache);
@@ -407,10 +419,13 @@ static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
                              err_t *err) {
     if (nrows == 0) return 0;
     st_tensor *t = w->t;
-    int64_t cols = t->shape[1];
+    // 2d tensors are [rows, cols]; 3d tensors (expert blocks) are
+    // [rows, sub, cols] and one row dequantizes to sub * cols values
+    int64_t sub = t->ndim == 3 ? t->shape[1] : 1;
+    int64_t cols = t->shape[1] * (t->ndim == 3 ? t->shape[2] : 1);
     char sn[512], bn[512];
-    snprintf(sn, sizeof(sn), "%s.scales", t->name);
-    snprintf(bn, sizeof(bn), "%s.biases", t->name);
+    side_name(sn, sizeof(sn), t->name, "scales");
+    side_name(bn, sizeof(bn), t->name, "biases");
     st_tensor *st_scales = st_find(&m->ix, sn);
     st_tensor *st_biases = st_find(&m->ix, bn);
     if (!st_scales) {
@@ -427,14 +442,15 @@ static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
         }
         for (size_t r = 0; r < nrows; r++) {
             const uint16_t *rowp = (const uint16_t *)(raw + r * row_bytes);
-            float *orow = out + r * (size_t)cols;
-            for (int64_t i = 0; i < cols; i++) orow[i] = bf16_to_f32(rowp[i]);
+            float *orow = out + r * (size_t)(sub * cols);
+            for (int64_t i = 0; i < sub * cols; i++) orow[i] = bf16_to_f32(rowp[i]);
         }
         free(raw);
         return 0;
     }
-    cols = t->shape[1] * 8; // q4: stored cols = cols/8
+    cols = cols * 8; // q4: stored cols = cols/8
     size_t row_bytes_q = (size_t)(t->nbytes / (uint64_t)t->shape[0]);
+    size_t scale_size = st_scales->dtype == ST_BF16 ? 2 : 4;
     size_t row_bytes_s = (size_t)(st_scales->nbytes / (uint64_t)st_scales->shape[0]);
     uint8_t *rawq = xmalloc(row_bytes_q * nrows);
     uint8_t *raws = xmalloc(row_bytes_s * nrows);
@@ -446,19 +462,32 @@ static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
     } else {
         memset(rawb, 0, row_bytes_s * nrows);
     }
-    size_t groups_per_row = row_bytes_s / 4;
+    size_t groups_per_row = row_bytes_s / scale_size / (size_t)sub;
+    size_t vals_per_sub = (size_t)(cols / sub);
     for (size_t r = 0; r < nrows; r++) {
         const uint32_t *qrow = (const uint32_t *)(rawq + r * row_bytes_q);
-        float *scales = xmalloc(groups_per_row * sizeof(float));
-        float *biases = xmalloc(groups_per_row * sizeof(float));
+        float *scales = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
+        float *biases = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
         const uint16_t *srow = (const uint16_t *)(raws + r * row_bytes_s);
         const uint16_t *brow = (const uint16_t *)(rawb + r * row_bytes_s);
-        for (size_t g = 0; g < groups_per_row; g++) {
-            scales[g] = bf16_to_f32(srow[g]);
-            biases[g] = bf16_to_f32(brow[g]);
+        if (scale_size == 2) {
+            for (size_t g = 0; g < groups_per_row * (size_t)sub; g++) {
+                scales[g] = bf16_to_f32(srow[g]);
+                biases[g] = bf16_to_f32(brow[g]);
+            }
+        } else {
+            memcpy(scales, raws + r * row_bytes_s,
+                   groups_per_row * (size_t)sub * sizeof(float));
+            memcpy(biases, rawb + r * row_bytes_s,
+                   groups_per_row * (size_t)sub * sizeof(float));
         }
-        kernel_dequant_q4_row(qrow, scales, biases, (size_t)cols, (size_t)group_size,
-                              out + r * cols);
+        for (int64_t s = 0; s < sub; s++) {
+            kernel_dequant_q4_row(qrow + (size_t)s * (vals_per_sub / 8),
+                                  scales + (size_t)s * groups_per_row,
+                                  biases + (size_t)s * groups_per_row,
+                                  vals_per_sub, group_size,
+                                  out + r * (size_t)cols + (size_t)s * vals_per_sub);
+        }
         free(scales);
         free(biases);
     }
@@ -497,17 +526,17 @@ static int experts_load(qmodel *m, int layer, const int64_t *ids, size_t n,
         }
         mweight tgw = {0}, tuw = {0}, tdw = {0};
         tgw.t = tg;
-        tgw.rows = tg->shape[0];
-        tgw.cols = tg->shape[1];
         tuw.t = tu;
-        tuw.rows = tu->shape[0];
-        tuw.cols = tu->shape[1];
         tdw.t = td;
-        tdw.rows = td->shape[0];
-        tdw.cols = td->shape[1];
-        int64_t cols = tgw.cols * 8;
-        int64_t moe_inter = tgw.rows;
-        float *w = xmalloc((size_t)cols * moe_inter * 3 * sizeof(float));
+        // expert blocks are [n_experts, moe_inter, hidden/8] (down:
+        // [n_experts, hidden, moe_inter/8]); one row dequantizes to a
+        // [moe_inter, hidden] matrix
+        int64_t cols = tg->shape[2] * 8;
+        int64_t moe_inter = tg->shape[1];
+        int64_t dcols = td->shape[2] * 8;
+        int64_t dmoe_inter = td->shape[1];
+        float *w = xmalloc((size_t)(cols * moe_inter + dcols * dmoe_inter) * 2 *
+                           sizeof(float));
         int64_t one = ids[i];
         double t0 = now_s();
         if (read_dequant_rows(m, &tgw, &one, 1, w, m->cfg.group_size, err) != 0) { free(w); return -1; }
@@ -516,9 +545,9 @@ static int experts_load(qmodel *m, int layer, const int64_t *ids, size_t n,
         double dt = now_s() - t0;
         m->stats.expert_loads++;
         m->stats.expert_wait_seconds += dt;
-        uint64_t bytes = (uint64_t)cols * (uint64_t)moe_inter * 3 * 4;
+        uint64_t bytes = (uint64_t)(cols * moe_inter + dcols * dmoe_inter) * 2 * 4;
         m->stats.expert_bytes += bytes;
-        cache_put(&m->expert_cache, key, w, bytes, 0, 0);
+        if (!cache_put(&m->expert_cache, key, w, bytes, 0, 0)) free(w);
     }
     return 0;
 }
@@ -561,7 +590,10 @@ static int ple_rows_load(qmodel *m, const int64_t *gids, size_t n, float *out,
             m->stats.ple_loads++;
             m->stats.ple_wait_seconds += now_s() - t0;
             m->stats.ple_bytes += (uint64_t)row_width * 4;
-            cache_put(&m->ple_cache, key, v, (uint64_t)row_width * 4, 0, 0);
+            if (!cache_put(&m->ple_cache, key, v, (uint64_t)row_width * 4, 0, 0)) {
+                free(v);
+                return -1;
+            }
         }
         memcpy(out + i * (size_t)row_width, v, (size_t)row_width * sizeof(float));
     }
@@ -1006,6 +1038,15 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
         uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)e;
         float *w = cache_get(&m->expert_cache, key);
         if (!w) {
+            // the unique set exceeded the cache budget and this expert was
+            // evicted before use; load it on demand
+            if (experts_load(m, layer, &e, 1, err) != 0) {
+                free(logits); free(idx); free(weights); free(unique);
+                return -1;
+            }
+            w = cache_get(&m->expert_cache, key);
+        }
+        if (!w) {
             err_set(err, "expert %lld vanished from cache", (long long)e);
             free(logits); free(idx); free(weights); free(unique);
             return -1;
@@ -1127,13 +1168,15 @@ static int ple_forward(qmodel *m, qlayer *l, float *h, const int64_t *tokens,
     }
     
     // key = norm_key(key_proj(emb)) [n, hc, d]
+    // the projectors use the global group size; only the ngram embedding
+    // shards are quantized at ple_group_size
     linear_forward(l->ple_key, n, hc_dim, c->ple_embed_dim, emb, key,
-                   m->cfg.ple_group_size);
+                   m->cfg.group_size);
     kernel_rmsnorm_grouped(key, l->ple_norm_key, (size_t)n * hc_dim, (size_t)d,
                            (size_t)n, 1e-6f, key);
     // value = value_proj(emb) [n, d]
     linear_forward(l->ple_val, n, d, c->ple_embed_dim, emb, value,
-                   m->cfg.ple_group_size);
+                   m->cfg.group_size);
     // query = norm_query(h) [n, hc, d]
     kernel_rmsnorm_grouped(h, l->ple_norm_query, (size_t)n * hc_dim, (size_t)d, (size_t)n, 1e-6f, query);
     
@@ -1234,8 +1277,8 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         if (need > max_fn_scratch) max_fn_scratch = need;
         // ple
         int state_len = (c->ple_conv_kernel_size - 1) * c->ngram_size;
-        need = (size_t)n * c->ple_embed_dim + (size_t)n * hc_dim * 4 +
-               (size_t)(state_len + 2 * n) * hc_dim;
+        need = (size_t)n * c->ple_embed_dim + (size_t)n * hc_dim * 3 + (size_t)n * d +
+               (size_t)(state_len + 3 * n) * hc_dim;
         if (need > max_fn_scratch) max_fn_scratch = need;
         // gated residual: normed + w + tmp + inject
         need = (size_t)n * hc_dim + (size_t)n * c->hc_lowrank + (size_t)n * hc_dim +
@@ -1376,7 +1419,21 @@ qmodel *model_load(const char *dir, int io_workers, uint64_t expert_budget,
         snprintf(nm, sizeof(nm), "model.layers.%d.ple.ple_embedding.ngram_heads_vocab_sizes", c->ple_layer);
         if (mw_load_i64(&m->ng_sizes, &m->ng_nheads, &m->ix, nm, err) != 0) goto fail;
         int64_t total = m->ng_offsets[m->ng_nheads - 1] + m->ng_sizes[m->ng_nheads - 1];
-        m->ple_rows_per_shard = total / c->split_ngram_parts;
+        (void)total;
+        // the shard shape is the authority; total/split rounds down and
+        // silently misroutes every gid after the first shard
+        {
+            char pname[512];
+            snprintf(pname, sizeof(pname),
+                     "model.layers.%d.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                     c->ple_layer);
+            st_tensor *shard0 = st_find(&m->ix, pname);
+            if (!shard0 || shard0->shape[0] < 1) {
+                err_set(err, "missing PLE shard_0 tensor");
+                goto fail;
+            }
+            m->ple_rows_per_shard = shard0->shape[0];
+        }
         if (m->ple_rows_per_shard < 1) {
             err_set(err, "invalid PLE table geometry");
             goto fail;
@@ -1384,6 +1441,8 @@ qmodel *model_load(const char *dir, int io_workers, uint64_t expert_budget,
     }
     cache_init(&m->expert_cache, expert_budget, CACHE_POLICY_ADAPTIVE, c->num_layers);
     cache_init(&m->ple_cache, ple_budget, CACHE_POLICY_ADAPTIVE, 0);
+    m->expert_cache.free_value = free;
+    m->ple_cache.free_value = free;
     // dense weights
     {
         char nm[512];
