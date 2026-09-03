@@ -16,8 +16,9 @@
 typedef struct qmodel qmodel;
 
 typedef struct {
-    uint64_t expert_loads, expert_wait_seconds, expert_bytes;
-    uint64_t ple_loads, ple_wait_seconds, ple_bytes;
+    uint64_t expert_loads, expert_bytes;
+    uint64_t ple_loads, ple_bytes;
+    double expert_wait_seconds, ple_wait_seconds;
     uint64_t prefill_calls, decode_calls;
     double forward_seconds;
 } qstats;
