@@ -13,3 +13,7 @@ c/test_*
 # binaries and debug symbols
 c/qwen38
 *.dSYM
+
+# local notes
+todo.md
+TODO.md
