@@ -9,3 +9,7 @@ artifacts/benchmark_results.json
 
 # c runtime build
 c/test_*
+
+# binaries and debug symbols
+c/qwen38
+*.dSYM
