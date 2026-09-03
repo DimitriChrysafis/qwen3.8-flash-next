@@ -1,5 +1,6 @@
 CC ?= clang
 CFLAGS ?= -std=c11 -O3 -Wall -Wextra -Wno-unused-parameter -Isrc -I.
+DEPFLAGS = -MMD -MP
 LDLIBS = -framework Accelerate -licucore
 
 OBJDIR = build
@@ -11,7 +12,9 @@ $(OBJDIR):
 	mkdir -p $(OBJDIR)
 
 $(OBJDIR)/%.o: src/%.c | $(OBJDIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+-include $(wildcard $(OBJDIR)/*.d)
 
 BIN = qwen38
 SRC = src/json.c src/safetensors.c src/reader.c src/cache.c src/kernel.c \
