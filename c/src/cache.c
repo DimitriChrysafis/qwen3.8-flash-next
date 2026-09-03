@@ -173,7 +173,10 @@ void cache_init(cache_t *c, uint64_t max_bytes, int policy, int partitions) {
 }
 
 void cache_destroy(cache_t *c) {
-    for (size_t i = 0; i < c->nslots; i++) free(c->slots[i]);
+    for (size_t i = 0; i < c->nslots; i++) {
+        if (c->slots[i] && c->free_value) c->free_value(c->slots[i]->value);
+        free(c->slots[i]);
+    }
     free(c->slots);
     pthread_mutex_destroy(&c->lock);
     memset(c, 0, sizeof(*c));
@@ -205,6 +208,16 @@ void *cache_get(cache_t *c, uint64_t key) {
     return v;
 }
 
+static void drop_entry(cache_t *c, cache_entry *e) {
+    if (c->free_value) c->free_value(e->value);
+    c->bytes -= e->nbytes;
+    if (e->pinned) c->pinned_count--;
+    unlink_entry(c, e);
+    remove_from_table(c, e);
+    free(e);
+    c->count--;
+}
+
 int cache_put(cache_t *c, uint64_t key, void *value, uint64_t nbytes, int pin,
               int hot) {
     pthread_mutex_lock(&c->lock);
@@ -217,12 +230,7 @@ int cache_put(cache_t *c, uint64_t key, void *value, uint64_t nbytes, int pin,
     if (old) {
         pin = pin || old->pinned;
         hot = hot || old->hot;
-        c->bytes -= old->nbytes;
-        if (old->pinned) c->pinned_count--;
-        unlink_entry(c, old);
-        remove_from_table(c, old);
-        free(old);
-        c->count--;
+        drop_entry(c, old);
     }
     uint64_t evicted = 0;
     while (c->max_bytes > 0 && c->bytes + nbytes > c->max_bytes) {
@@ -232,12 +240,7 @@ int cache_put(cache_t *c, uint64_t key, void *value, uint64_t nbytes, int pin,
             pthread_mutex_unlock(&c->lock);
             return 0;
         }
-        c->bytes -= victim->nbytes;
-        if (victim->pinned) c->pinned_count--;
-        unlink_entry(c, victim);
-        remove_from_table(c, victim);
-        free(victim);
-        c->count--;
+        drop_entry(c, victim);
         evicted++;
     }
     cache_entry *e = xcalloc(1, sizeof(cache_entry));

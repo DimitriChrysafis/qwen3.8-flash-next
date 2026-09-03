@@ -26,6 +26,7 @@ typedef struct {
     uint64_t max_bytes;
     int policy;
     int partitions; // 0 = no partition fairness
+    void (*free_value)(void *value); // optional value destructor
     cache_entry **slots;
     size_t nslots, count;
     cache_entry *head, *tail; // recency list, head is most recent
