@@ -412,6 +412,58 @@ typedef struct {
     uint64_t total_ple_rows;
 } stores;
 
+// dequantize nrows already-read raw rows of a q4 tensor into fp32
+// (nrows x cols). group_size applies to the q4 path.
+static int dequant_raw(st_tensor *t, st_tensor *st_scales, st_tensor *st_biases,
+                       const uint8_t *rawq, const uint8_t *raws,
+                       const uint8_t *rawb, size_t nrows, float *out,
+                       int group_size) {
+    // 2d tensors are [rows, cols]; 3d tensors (expert blocks) are
+    // [rows, sub, cols] and one row dequantizes to sub * cols values
+    int64_t sub = t->ndim == 3 ? t->shape[1] : 1;
+    int64_t cols = t->shape[1] * (t->ndim == 3 ? t->shape[2] : 1);
+    cols = cols * 8; // q4: stored cols = cols/8
+    size_t row_bytes_q = (size_t)(t->nbytes / (uint64_t)t->shape[0]);
+    size_t scale_size = st_scales->dtype == ST_BF16 ? 2 : 4;
+    size_t row_bytes_s = (size_t)(st_scales->nbytes / (uint64_t)st_scales->shape[0]);
+    size_t groups_per_row = row_bytes_s / scale_size / (size_t)sub;
+    size_t vals_per_sub = (size_t)(cols / sub);
+    for (size_t r = 0; r < nrows; r++) {
+        const uint32_t *qrow = (const uint32_t *)(rawq + r * row_bytes_q);
+        float scales[512], biases[512];
+        float *sp = scales, *bp = biases;
+        if (groups_per_row * (size_t)sub > 512) {
+            sp = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
+            bp = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
+        }
+        const uint16_t *srow = (const uint16_t *)(raws + r * row_bytes_s);
+        const uint16_t *brow = (const uint16_t *)(rawb + r * row_bytes_s);
+        if (scale_size == 2) {
+            for (size_t g = 0; g < groups_per_row * (size_t)sub; g++) {
+                sp[g] = bf16_to_f32(srow[g]);
+                bp[g] = bf16_to_f32(brow[g]);
+            }
+        } else {
+            memcpy(sp, raws + r * row_bytes_s,
+                   groups_per_row * (size_t)sub * sizeof(float));
+            memcpy(bp, rawb + r * row_bytes_s,
+                   groups_per_row * (size_t)sub * sizeof(float));
+        }
+        for (int64_t s = 0; s < sub; s++) {
+            kernel_dequant_q4_row(qrow + (size_t)s * (vals_per_sub / 8),
+                                  sp + (size_t)s * groups_per_row,
+                                  bp + (size_t)s * groups_per_row,
+                                  vals_per_sub, group_size,
+                                  out + r * (size_t)cols + (size_t)s * vals_per_sub);
+        }
+        if (sp != scales) {
+            free(sp);
+            free(bp);
+        }
+    }
+    return 0;
+}
+
 // read rows of a q4 (or plain bf16) tensor and expand into fp32
 // (nrows x cols). group_size applies to the q4 path.
 static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
@@ -450,7 +502,6 @@ static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
     }
     cols = cols * 8; // q4: stored cols = cols/8
     size_t row_bytes_q = (size_t)(t->nbytes / (uint64_t)t->shape[0]);
-    size_t scale_size = st_scales->dtype == ST_BF16 ? 2 : 4;
     size_t row_bytes_s = (size_t)(st_scales->nbytes / (uint64_t)st_scales->shape[0]);
     uint8_t *rawq = xmalloc(row_bytes_q * nrows);
     uint8_t *raws = xmalloc(row_bytes_s * nrows);
@@ -462,39 +513,12 @@ static int read_dequant_rows(qmodel *m, mweight *w, const int64_t *rows,
     } else {
         memset(rawb, 0, row_bytes_s * nrows);
     }
-    size_t groups_per_row = row_bytes_s / scale_size / (size_t)sub;
-    size_t vals_per_sub = (size_t)(cols / sub);
-    for (size_t r = 0; r < nrows; r++) {
-        const uint32_t *qrow = (const uint32_t *)(rawq + r * row_bytes_q);
-        float *scales = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
-        float *biases = xmalloc(groups_per_row * (size_t)sub * sizeof(float));
-        const uint16_t *srow = (const uint16_t *)(raws + r * row_bytes_s);
-        const uint16_t *brow = (const uint16_t *)(rawb + r * row_bytes_s);
-        if (scale_size == 2) {
-            for (size_t g = 0; g < groups_per_row * (size_t)sub; g++) {
-                scales[g] = bf16_to_f32(srow[g]);
-                biases[g] = bf16_to_f32(brow[g]);
-            }
-        } else {
-            memcpy(scales, raws + r * row_bytes_s,
-                   groups_per_row * (size_t)sub * sizeof(float));
-            memcpy(biases, rawb + r * row_bytes_s,
-                   groups_per_row * (size_t)sub * sizeof(float));
-        }
-        for (int64_t s = 0; s < sub; s++) {
-            kernel_dequant_q4_row(qrow + (size_t)s * (vals_per_sub / 8),
-                                  scales + (size_t)s * groups_per_row,
-                                  biases + (size_t)s * groups_per_row,
-                                  vals_per_sub, group_size,
-                                  out + r * (size_t)cols + (size_t)s * vals_per_sub);
-        }
-        free(scales);
-        free(biases);
-    }
+    int rc = dequant_raw(t, st_scales, st_biases, rawq, raws, rawb, nrows, out,
+                         group_size);
     free(rawq);
     free(raws);
     free(rawb);
-    return 0;
+    return rc;
 fail:
     free(rawq);
     free(raws);
@@ -502,54 +526,144 @@ fail:
     return -1;
 }
 
-// load a set of experts for one layer into the cache; returns 0 on success.
+// load a set of experts for one layer into the cache. all raw row reads are
+// submitted to the io pool up front so the device sees a deep queue, then
+// each expert is dequantized as its reads complete.
 static int experts_load(qmodel *m, int layer, const int64_t *ids, size_t n,
                         err_t *err) {
+    char gname[256], uname[256], dname[256];
+    snprintf(gname, sizeof(gname),
+             "model.layers.%d.mlp.switch_mlp.gate_proj.weight", layer);
+    snprintf(uname, sizeof(uname),
+             "model.layers.%d.mlp.switch_mlp.up_proj.weight", layer);
+    snprintf(dname, sizeof(dname),
+             "model.layers.%d.mlp.switch_mlp.down_proj.weight", layer);
+    st_tensor *tg = st_find(&m->ix, gname);
+    st_tensor *tu = st_find(&m->ix, uname);
+    st_tensor *td = st_find(&m->ix, dname);
+    if (!tg || !tu || !td) {
+        err_set(err, "missing expert tensors for layer %d", layer);
+        return -1;
+    }
+    // expert blocks are [n_experts, moe_inter, hidden/8] (down:
+    // [n_experts, hidden, moe_inter/8]); one row dequantizes to a
+    // [moe_inter, hidden] matrix
+    int64_t cols = tg->shape[2] * 8;
+    int64_t moe_inter = tg->shape[1];
+    int64_t dcols = td->shape[2] * 8;
+    int64_t dmoe_inter = td->shape[1];
+    size_t qrow_g = (size_t)(tg->nbytes / (uint64_t)tg->shape[0]);
+    size_t qrow_d = (size_t)(td->nbytes / (uint64_t)td->shape[0]);
+    st_tensor *sg = st_find(&m->ix, gname), *bg = NULL;
+    st_tensor *su = st_find(&m->ix, uname), *bu = NULL;
+    st_tensor *sd = st_find(&m->ix, dname), *bd = NULL;
+    {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s", gname);
+        side_name(buf, sizeof(buf), gname, "scales");
+        sg = st_find(&m->ix, buf);
+        side_name(buf, sizeof(buf), gname, "biases");
+        bg = st_find(&m->ix, buf);
+        side_name(buf, sizeof(buf), uname, "scales");
+        su = st_find(&m->ix, buf);
+        side_name(buf, sizeof(buf), uname, "biases");
+        bu = st_find(&m->ix, buf);
+        side_name(buf, sizeof(buf), dname, "scales");
+        sd = st_find(&m->ix, buf);
+        side_name(buf, sizeof(buf), dname, "biases");
+        bd = st_find(&m->ix, buf);
+    }
+    if (!sg || !su || !sd || !bg || !bu || !bd) {
+        err_set(err, "missing expert scales/biases for layer %d", layer);
+        return -1;
+    }
+    size_t srow_g = (size_t)(sg->nbytes / (uint64_t)sg->shape[0]);
+    size_t srow_d = (size_t)(sd->nbytes / (uint64_t)sd->shape[0]);
+
+    // collect the experts that are not cached
+    int64_t *pending = xmalloc((size_t)n * sizeof(int64_t));
+    size_t npending = 0;
     for (size_t i = 0; i < n; i++) {
         uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)ids[i];
         if (cache_peek(&m->expert_cache, key)) continue;
-        // read gate/up/down rows for this expert
-        char gname[256], uname[256], dname[256];
-        snprintf(gname, sizeof(gname),
-                 "model.layers.%d.mlp.switch_mlp.gate_proj.weight", layer);
-        snprintf(uname, sizeof(uname),
-                 "model.layers.%d.mlp.switch_mlp.up_proj.weight", layer);
-        snprintf(dname, sizeof(dname),
-                 "model.layers.%d.mlp.switch_mlp.down_proj.weight", layer);
-        // expert tensors are streamed: resolve via the index
-        st_tensor *tg = st_find(&m->ix, gname);
-        st_tensor *tu = st_find(&m->ix, uname);
-        st_tensor *td = st_find(&m->ix, dname);
-        if (!tg || !tu || !td) {
-            err_set(err, "missing expert tensors for layer %d", layer);
-            return -1;
+        pending[npending++] = ids[i];
+    }
+    if (!npending) {
+        free(pending);
+        return 0;
+    }
+
+    // per-expert raw block: gate q/s/b, up q/s/b, down q/s/b
+    size_t off[9];
+    off[0] = 0;               // gate q
+    off[1] = off[0] + qrow_g; // gate s
+    off[2] = off[1] + srow_g; // gate b
+    off[3] = off[2] + srow_g; // up q
+    off[4] = off[3] + qrow_g; // up s
+    off[5] = off[4] + srow_g; // up b
+    off[6] = off[5] + srow_g; // down q
+    off[7] = off[6] + qrow_d; // down s
+    off[8] = off[7] + srow_d; // down b
+    size_t blk = off[8] + srow_d;
+    io_job *jobs = xcalloc(npending * 9, sizeof(io_job));
+    uint8_t *raw = xmalloc(npending * blk);
+    int64_t *row_of = xmalloc(npending * sizeof(int64_t));
+    for (size_t i = 0; i < npending; i++) {
+        row_of[i] = pending[i];
+        uint8_t *b = raw + i * blk;
+        st_tensor *targs[9] = {tg, sg, bg, tu, su, bu, td, sd, bd};
+        for (int j = 0; j < 9; j++) {
+            if (st_read_rows_async(&m->ix, targs[j], &row_of[i], 1, b + off[j],
+                                   &jobs[i * 9 + j]) != 0) {
+                err_set(err, "expert row submit failed for layer %d", layer);
+                goto fail;
+            }
         }
-        mweight tgw = {0}, tuw = {0}, tdw = {0};
-        tgw.t = tg;
-        tuw.t = tu;
-        tdw.t = td;
-        // expert blocks are [n_experts, moe_inter, hidden/8] (down:
-        // [n_experts, hidden, moe_inter/8]); one row dequantizes to a
-        // [moe_inter, hidden] matrix
-        int64_t cols = tg->shape[2] * 8;
-        int64_t moe_inter = tg->shape[1];
-        int64_t dcols = td->shape[2] * 8;
-        int64_t dmoe_inter = td->shape[1];
+    }
+
+    for (size_t i = 0; i < npending; i++) {
+        double t0 = now_s();
+        for (int j = 0; j < 9; j++) {
+            int st = io_job_wait(&jobs[i * 9 + j]);
+            if (st) {
+                err_set(err, "expert row read failed for layer %d: %s", layer,
+                        strerror(st));
+                goto fail;
+            }
+        }
+        m->ix.rows_read += 9;
+        uint8_t *b = raw + i * blk;
         float *w = xmalloc((size_t)(cols * moe_inter + dcols * dmoe_inter) * 2 *
                            sizeof(float));
-        int64_t one = ids[i];
-        double t0 = now_s();
-        if (read_dequant_rows(m, &tgw, &one, 1, w, m->cfg.group_size, err) != 0) { free(w); return -1; }
-        if (read_dequant_rows(m, &tuw, &one, 1, w + (size_t)cols * moe_inter, m->cfg.group_size, err) != 0) { free(w); return -1; }
-        if (read_dequant_rows(m, &tdw, &one, 1, w + (size_t)cols * moe_inter * 2, m->cfg.group_size, err) != 0) { free(w); return -1; }
+        if (dequant_raw(tg, sg, bg, b + off[0], b + off[1], b + off[2], 1, w,
+                        m->cfg.group_size) != 0 ||
+            dequant_raw(tu, su, bu, b + off[3], b + off[4], b + off[5], 1,
+                        w + (size_t)cols * moe_inter, m->cfg.group_size) != 0 ||
+            dequant_raw(td, sd, bd, b + off[6], b + off[7], b + off[8], 1,
+                        w + (size_t)cols * moe_inter * 2,
+                        m->cfg.group_size) != 0) {
+            free(w);
+            goto fail;
+        }
         double dt = now_s() - t0;
         m->stats.expert_loads++;
         m->stats.expert_wait_seconds += dt;
         uint64_t bytes = (uint64_t)(cols * moe_inter + dcols * dmoe_inter) * 2 * 4;
         m->stats.expert_bytes += bytes;
+        uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)pending[i];
         if (!cache_put(&m->expert_cache, key, w, bytes, 0, 0)) free(w);
     }
+    free(pending);
+    free(jobs);
+    free(raw);
+    free(row_of);
     return 0;
+fail:
+    free(pending);
+    free(jobs);
+    free(raw);
+    free(row_of);
+    return -1;
 }
 
 static int ple_rows_load(qmodel *m, const int64_t *gids, size_t n, float *out,
@@ -781,9 +895,11 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
             free(inv);
         }
         kernel_rope_partial(pooled, (size_t)n_blocks, (size_t)c->indexer_head_dim, (size_t)rot_dim, bcos, bsin, pooled);
+        float *qscore = xmalloc((size_t)c->indexer_n_heads * c->indexer_head_dim * sizeof(float));
+        float *bscores = xmalloc((size_t)n_blocks * sizeof(float));
+        int *top = xmalloc((size_t)block_topk * sizeof(int));
         for (int t = 0; t < n; t++) {
             // q indexer: [n, idx_heads, idx_hd] from qk
-            float *qscore = xmalloc((size_t)n * 0 + (size_t)c->indexer_n_heads * c->indexer_head_dim * sizeof(float));
             for (int hh = 0; hh < c->indexer_n_heads; hh++) {
                 kernel_rmsnorm(qk + (size_t)t * (idx_out + c->indexer_head_dim) + (size_t)hh * c->indexer_head_dim,
                                l->idx_q_norm,
@@ -830,10 +946,10 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
                     if (!keep && kk <= offset + t) srow[kk] = -INFINITY;
                 }
             }
-            free(qscore);
-            free(bscores);
-            free(top);
         }
+        free(qscore);
+        free(bscores);
+        free(top);
         free(pooled);
         free(bcos);
         free(bsin);
@@ -985,15 +1101,25 @@ static void deltanet_forward(qmodel *m, qlayer *l, const float *x, int n,
 
 // moe. x: [n, d]; out: [n, d]
 static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
-                       err_t *err) {
+                       float *scratch, err_t *err) {
     qcfg *c = &m->cfg;
     int d = c->hidden_size;
     int topk = c->num_experts_per_tok;
     int n_exp = c->num_experts;
     int moe_inter = c->moe_intermediate_size;
-    float *logits = xmalloc((size_t)n * n_exp * sizeof(float));
-    int *idx = xmalloc((size_t)n * topk * sizeof(int));
-    float *weights = xmalloc((size_t)n * topk * sizeof(float));
+    // per-call buffers come from the layer scratch (free after the gated
+    // residual that ran just before us)
+    int64_t *unique = (int64_t *)scratch;
+    int *idx = (int *)(unique + (size_t)n * topk);
+    int *tok_ids = idx + (size_t)n * topk;
+    float *weights = (float *)(tok_ids + (size_t)n * topk);
+    float *logits = weights + (size_t)n * topk;
+    float *x_sel = logits + (size_t)n * n_exp;
+    float *g_out = x_sel + (size_t)n * d;
+    float *u_out = g_out + (size_t)n * moe_inter;
+    float *r_out = u_out + (size_t)n * moe_inter;
+    float *sh = r_out + (size_t)n * d;
+    float *sh_out = sh + (size_t)n * moe_inter;
     gemm_bf16(n, n_exp, d, x, l->gate->bf16, logits);
     for (int t = 0; t < n; t++) {
         kernel_topk_indices(logits + (size_t)t * n_exp, (size_t)n_exp, (size_t)topk,
@@ -1015,7 +1141,6 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
     }
     memset(out, 0, (size_t)n * d * sizeof(float));
     // unique experts
-    int64_t *unique = xmalloc((size_t)n * topk * sizeof(int64_t));
     size_t nunique = 0;
     for (int t = 0; t < n; t++) {
         for (int s = 0; s < topk; s++) {
@@ -1028,7 +1153,6 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
         }
     }
     if (experts_load(m, l - m->layers, unique, nunique, err) != 0) {
-        free(logits); free(idx); free(weights); free(unique);
         return -1;
     }
     // per expert: gather tokens and compute
@@ -1041,18 +1165,15 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
             // the unique set exceeded the cache budget and this expert was
             // evicted before use; load it on demand
             if (experts_load(m, layer, &e, 1, err) != 0) {
-                free(logits); free(idx); free(weights); free(unique);
                 return -1;
             }
             w = cache_get(&m->expert_cache, key);
         }
         if (!w) {
             err_set(err, "expert %lld vanished from cache", (long long)e);
-            free(logits); free(idx); free(weights); free(unique);
             return -1;
         }
         // gather tokens routing to this expert
-        int *tok_ids = xmalloc((size_t)n * sizeof(int));
         size_t ntoks = 0;
         for (int t = 0; t < n; t++) {
             for (int s = 0; s < topk; s++) {
@@ -1062,12 +1183,7 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
                 }
             }
         }
-        if (ntoks == 0) { free(tok_ids); continue; }
-        // x_sel [ntoks, d]
-        float *x_sel = xmalloc(ntoks * (size_t)d * sizeof(float));
-        float *g_out = xmalloc(ntoks * (size_t)moe_inter * sizeof(float));
-        float *u_out = xmalloc(ntoks * (size_t)moe_inter * sizeof(float));
-        float *r_out = xmalloc(ntoks * (size_t)d * sizeof(float));
+        if (ntoks == 0) continue;
         for (size_t i = 0; i < ntoks; i++) {
             memcpy(x_sel + i * (size_t)d, x + (size_t)tok_ids[i] * d, (size_t)d * sizeof(float));
         }
@@ -1090,17 +1206,10 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
                 }
             }
         }
-        free(tok_ids);
-        free(x_sel);
-        free(g_out);
-        free(u_out);
-        free(r_out);
     }
     // shared expert
     {
-        float *sh = xmalloc((size_t)n * moe_inter * sizeof(float));
-        float *sh_out = xmalloc((size_t)n * d * sizeof(float));
-        float *gatev = xmalloc((size_t)n * sizeof(float));
+        float *gatev = sh_out + (size_t)n * d;
         linear_forward(l->sh_g, n, moe_inter, d, x, sh, 64);
         linear_forward(l->sh_u, n, moe_inter, d, x, sh_out, 64);
         kernel_silu(sh, (size_t)n * moe_inter, sh);
@@ -1113,14 +1222,7 @@ static int moe_forward(qmodel *m, qlayer *l, const float *x, int n, float *out,
                 out[(size_t)t * d + j] += g * sh_out[(size_t)t * d + j];
             }
         }
-        free(sh);
-        free(sh_out);
-        free(gatev);
     }
-    free(logits);
-    free(idx);
-    free(weights);
-    free(unique);
     return 0;
 }
 
@@ -1284,6 +1386,10 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         need = (size_t)n * hc_dim + (size_t)n * c->hc_lowrank + (size_t)n * hc_dim +
                (size_t)n * hc + (size_t)n * d;
         if (need > max_fn_scratch) max_fn_scratch = need;
+        // moe: unique/idx/tok_ids/weights + router logits + expert workspace
+        need = (size_t)n * (size_t)(4 * c->num_experts_per_tok + c->num_experts +
+                                    3 * d + 3 * c->moe_intermediate_size) + 2;
+        if (need > max_fn_scratch) max_fn_scratch = need;
     }
     size_t scratch_bytes = (size_t)n * hc_dim * 2 + max_fn_scratch + (size_t)n * 1024;
     float *scratch = xmalloc(scratch_bytes * sizeof(float));
@@ -1372,7 +1478,7 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         
         gated_residual(h, l->mh_norm, l->mh_down, l->mh_up, l->mh_inject, hc, d,
                        c->hc_lowrank, (int)n, mixed, inject, fn_scratch);
-        if (moe_forward(m, l, mixed, (int)n, attn_out, err) != 0) goto out;
+        if (moe_forward(m, l, mixed, (int)n, attn_out, fn_scratch, err) != 0) goto out;
         
         
         for (int t = 0; t < (int)n; t++) {

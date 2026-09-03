@@ -216,7 +216,8 @@ void gemm_q4(int M, int N, int K, const float *A, const uint32_t *W,
     if (M <= 0 || N <= 0) return;
     int groups = K / group_size;
     int words_per_group = group_size / 8;
-    float *xsum = xmalloc((size_t)groups * sizeof(float));
+    float xsum_stack[512];
+    float *xsum = groups <= 512 ? xsum_stack : xmalloc((size_t)groups * sizeof(float));
     // block over outputs for register reuse
     for (int m = 0; m < M; m++) {
         const float *a = A + (size_t)m * K;
@@ -287,7 +288,7 @@ void gemm_q4(int M, int N, int K, const float *A, const uint32_t *W,
             c[n] = acc;
         }
     }
-    free(xsum);
+    if (xsum != xsum_stack) free(xsum);
 }
 
 void kernel_conv1d_depthwise(const float *x, size_t seq, size_t ch,

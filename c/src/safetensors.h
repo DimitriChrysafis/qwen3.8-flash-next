@@ -68,4 +68,9 @@ int st_read_tensor(st_index *ix, st_tensor *t, void *out, err_t *err);
 int st_read_rows(st_index *ix, st_tensor *t, const int64_t *rows, size_t nrows,
                  void *out, err_t *err);
 
+// async variant: submit the read and return immediately; complete it with
+// io_job_wait(job). returns -1 on invalid args.
+int st_read_rows_async(st_index *ix, st_tensor *t, const int64_t *rows,
+                       size_t nrows, void *out, io_job *job);
+
 #endif

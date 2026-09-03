@@ -378,3 +378,22 @@ int st_read_rows(st_index *ix, st_tensor *t, const int64_t *rows, size_t nrows,
     ix->rows_read += nrows;
     return 0;
 }
+
+// async variant: submit only; complete with io_job_wait. the tensor and the
+// out buffer must stay alive until the wait returns.
+int st_read_rows_async(st_index *ix, st_tensor *t, const int64_t *rows,
+                       size_t nrows, void *out, io_job *job) {
+    if (t->ndim == 0 || t->shape[0] == 0) return -1;
+    for (size_t i = 0; i < nrows; i++) {
+        if (rows[i] < 0 || rows[i] >= t->shape[0]) return -1;
+    }
+    memset(job, 0, sizeof(*job));
+    job->fd = ix->fds[t->file];
+    job->base = t->offset;
+    job->row_bytes = t->nbytes / (uint64_t)t->shape[0];
+    job->rows = rows;
+    job->nrows = nrows;
+    job->out = out;
+    io_pool_submit(&ix->pool, job);
+    return 0;
+}
