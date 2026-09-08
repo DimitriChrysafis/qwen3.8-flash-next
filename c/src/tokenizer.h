@@ -20,4 +20,6 @@ char *tokenizer_decode(tokenizer *t, const int64_t *ids, size_t n);
 
 int64_t tokenizer_eos(const tokenizer *t);
 
+int64_t tokenizer_special(const tokenizer *t, const char *content);
+
 #endif

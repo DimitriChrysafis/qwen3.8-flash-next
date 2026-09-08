@@ -564,6 +564,10 @@ struct tokenizer {
     uint8_t byte_form[256][3];
     uint8_t byte_form_len[256];
     int32_t eos_id;
+    uint8_t **at_bytes;
+    size_t *at_lens;
+    int32_t *at_ids;
+    size_t at_n;
 };
 
 typedef struct {
@@ -721,6 +725,19 @@ tokenizer *tokenizer_load(const char *dir) {
                 t->eos_id = id;
             }
         }
+
+        t->at_n = added.n;
+        if (added.n) {
+            t->at_bytes = xmalloc(added.n * sizeof(uint8_t *));
+            t->at_lens = xmalloc(added.n * sizeof(size_t));
+            t->at_ids = xmalloc(added.n * sizeof(int32_t));
+            for (size_t i = 0; i < added.n; i++) {
+                t->at_bytes[i] = xmalloc(added.lens[i]);
+                memcpy(t->at_bytes[i], added.bytes[i], added.lens[i]);
+                t->at_lens[i] = added.lens[i];
+                t->at_ids[i] = added.ids[i];
+            }
+        }
     }
 
     // merges ("left right" strings, rank = position)
@@ -796,11 +813,27 @@ void tokenizer_free(tokenizer *t) {
         free(t->id_bytes);
         free(t->id_lens);
     }
+    if (t->at_bytes) {
+        for (size_t i = 0; i < t->at_n; i++) free(t->at_bytes[i]);
+        free(t->at_bytes);
+        free(t->at_lens);
+        free(t->at_ids);
+    }
     free(t);
 }
 
 int64_t tokenizer_eos(const tokenizer *t) {
     return t->eos_id;
+}
+
+int64_t tokenizer_special(const tokenizer *t, const char *content) {
+    size_t len = strlen(content);
+    for (size_t i = 0; i < t->at_n; i++) {
+        if (t->at_lens[i] == len && memcmp(t->at_bytes[i], content, len) == 0) {
+            return t->at_ids[i];
+        }
+    }
+    return -1;
 }
 
 // bpe one pre-token: bytes in, token ids out. returns count, -1 on error.
@@ -868,18 +901,50 @@ static long encode_chunk(const tokenizer *t, const uint8_t *s, size_t len,
     return (long)n;
 }
 
+static int64_t added_at(const tokenizer *t, const uint8_t *s, size_t len,
+                        size_t p, size_t *ml) {
+    int64_t id = -1;
+    *ml = 0;
+    for (size_t k = 0; k < t->at_n; k++) {
+        size_t l = t->at_lens[k];
+        if (l > *ml && l <= len - p && memcmp(s + p, t->at_bytes[k], l) == 0) {
+            *ml = l;
+            id = t->at_ids[k];
+        }
+    }
+    return id;
+}
+
 int tokenizer_encode(tokenizer *t, const char *text, int64_t *ids, size_t cap) {
     const uint8_t *s = (const uint8_t *)text;
     size_t len = strlen(text);
     size_t total = 0;
     size_t i = 0;
     while (i < len) {
-        size_t e = pretoken_end(s, len, i);
-        if (!e) e = next_cp(s, len, i); // unmatched char stands alone
-        long c = encode_chunk(t, s + i, e - i, ids + total, cap - total);
-        if (c < 0) return -1;
-        total += (size_t)c;
-        i = e;
+        size_t ml = 0;
+        int64_t aid = added_at(t, s, len, i, &ml);
+        if (aid >= 0) {
+            if (total + 1 > cap) return -1;
+            ids[total++] = aid;
+            i += ml;
+            continue;
+        }
+        size_t lim = len;
+        for (size_t p = i + 1; p < len; p++) {
+            if (added_at(t, s, len, p, &ml) >= 0) {
+                lim = p;
+                break;
+            }
+        }
+        while (i < lim) {
+            size_t e = pretoken_end(s, lim, i);
+            if (!e) e = next_cp(s, lim, i);
+            if (e > lim) e = lim;
+            long c = encode_chunk(t, s + i, e - i, ids + total, cap - total);
+            if (c < 0) return -1;
+            total += (size_t)c;
+            i = e;
+        }
     }
     return (int)total;
 }

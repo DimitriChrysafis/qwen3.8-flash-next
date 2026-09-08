@@ -17,6 +17,12 @@ static const char *TINY_JSON =
     "     \"special\": true},\n"
     "    {\"id\": 11, \"content\": \"<|im_end|>\", \"single_word\": false,\n"
     "     \"lstrip\": false, \"rstrip\": false, \"normalized\": false,\n"
+    "     \"special\": true},\n"
+    "    {\"id\": 12, \"content\": \"<|tool|>\", \"single_word\": false,\n"
+    "     \"lstrip\": false, \"rstrip\": false, \"normalized\": false,\n"
+    "     \"special\": false},\n"
+    "    {\"id\": 13, \"content\": \"<|im_end|>!\", \"single_word\": false,\n"
+    "     \"lstrip\": false, \"rstrip\": false, \"normalized\": false,\n"
     "     \"special\": true}\n"
     "  ],\n"
     "  \"model\": {\n"
@@ -86,6 +92,37 @@ static void test_load_and_roundtrip(void) {
     s = tokenizer_decode(t, special, 2);
     CHECK(s && strcmp(s, "Hi<|im_end|>") == 0);
     free(s);
+
+    n = tokenizer_encode(t, "Hi<|im_end|> i", ids, 64);
+    CHECK(n == 3 && ids[0] == 4 && ids[1] == 11 && ids[2] == 5);
+    n = tokenizer_encode(t, "x<|im_end|>x", ids, 64);
+    CHECK(n == 3 && ids[0] == 9 && ids[1] == 11 && ids[2] == 9);
+    n = tokenizer_encode(t, "x<|im_end|>", ids, 64);
+    CHECK(n == 2 && ids[0] == 9 && ids[1] == 11);
+    n = tokenizer_encode(t, "<|im_end|>x", ids, 64);
+    CHECK(n == 2 && ids[0] == 11 && ids[1] == 9);
+    n = tokenizer_encode(t, "x<|endoftext|>x", ids, 64);
+    CHECK(n == 3 && ids[0] == 9 && ids[1] == 10 && ids[2] == 9);
+
+    n = tokenizer_encode(t, "<|tool|>", ids, 64);
+    CHECK(n == 1 && ids[0] == 12);
+    n = tokenizer_encode(t, "x<|tool|>x", ids, 64);
+    CHECK(n == 3 && ids[0] == 9 && ids[1] == 12 && ids[2] == 9);
+    n = tokenizer_encode(t, "Hi<|tool|>i", ids, 64);
+    CHECK(n == 3 && ids[0] == 4 && ids[1] == 12 && ids[2] == 2);
+
+    n = tokenizer_encode(t, "<|im_end|>!", ids, 64);
+    CHECK(n == 1 && ids[0] == 13);
+    n = tokenizer_encode(t, "<|im_end|>", ids, 64);
+    CHECK(n == 1 && ids[0] == 11);
+    n = tokenizer_encode(t, "x<|im_end|>!x", ids, 64);
+    CHECK(n == 3 && ids[0] == 9 && ids[1] == 13 && ids[2] == 9);
+
+    CHECK(tokenizer_special(t, "<|im_end|>") == 11);
+    CHECK(tokenizer_special(t, "<|tool|>") == 12);
+    CHECK(tokenizer_special(t, "<|im_end|>!") == 13);
+    CHECK(tokenizer_special(t, "<|nope|>") == -1);
+    CHECK(tokenizer_special(t, "<|im_end|") == -1);
 
     // unknown id is skipped, not crashed on
     int64_t bad[2] = {4, 999};
