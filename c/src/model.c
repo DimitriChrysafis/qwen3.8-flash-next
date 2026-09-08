@@ -101,6 +101,13 @@ static int load_cfg(qcfg *c, const char *dir, err_t *err) {
     c->seed = json_num_i64(json_obj_get(text, "seed"));
     json_value *rp = json_obj_get(text, "rope_parameters");
     c->rope_theta = rp ? (float)json_num_f64(json_obj_get(rp, "rope_theta")) : 10000000.0f;
+    if (rp) {
+        json_value *prf = json_obj_get(rp, "partial_rotary_factor");
+        if (prf) c->partial_rotary_factor = (float)json_num_f64(prf);
+    }
+    if (c->partial_rotary_factor <= 0.0f || c->partial_rotary_factor > 1.0f) {
+        c->partial_rotary_factor = 1.0f;
+    }
     c->rms_norm_eps = 1e-6f;
     json_value *lt = json_obj_get(text, "layer_types");
     if (lt && lt->type == JSON_ARR) {
@@ -724,6 +731,25 @@ static void gated_residual(const float *x, const float *hc_norm,
                            float *inject_out, float *scratch) {
     // normed = rmsnorm_grouped(x, hc_norm) over groups of d
     kernel_rmsnorm_grouped(x, hc_norm, (size_t)n * hc * d, (size_t)d, (size_t)n, 1e-6f, scratch);
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            static unsigned long call = 0;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/gr_x_%lu_n%zu.bin", dd, call, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(x, sizeof(float), (size_t)n * hc * d, f);
+                fclose(f);
+            }
+            snprintf(path, sizeof(path), "%s/gr_normed_%lu_n%zu.bin", dd, call++, (size_t)n);
+            f = fopen(path, "wb");
+            if (f) {
+                fwrite(scratch, sizeof(float), (size_t)n * hc * d, f);
+                fclose(f);
+            }
+        }
+    }
     float *w = scratch + (size_t)n * hc * d; // [n, lowrank]
     float *tmp = w + (size_t)n * lowrank;    // [n, hc*d]
     // w = silu(down(normed) / hc)
@@ -733,6 +759,19 @@ static void gated_residual(const float *x, const float *hc_norm,
     // w = sigmoid(up(w)) -> [n, hc, d]
     linear_forward(up, n, (int)up->rows, (int)up->cols, w, tmp, 64);
     kernel_sigmoid(tmp, (size_t)n * hc * d, tmp);
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            static unsigned long call = 0;
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/gr_w_%lu_n%zu.bin", dd, call++, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(tmp, sizeof(float), (size_t)n * hc * d, f);
+                fclose(f);
+            }
+        }
+    }
     
     // mixed = mean over hc of tmp * normed
     for (int t = 0; t < n; t++) {
@@ -785,6 +824,18 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
                rawk + (size_t)t * (idx_out + c->indexer_head_dim),
                (size_t)c->indexer_head_dim * sizeof(float));
     }
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/idx_keys_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(l->idx_keys, sizeof(float), (size_t)(l->idx_len + n) * c->indexer_head_dim, f);
+                fclose(f);
+            }
+        }
+    }
     int kv_len = l->idx_len + n;
     l->idx_len = kv_len;
     // q/k projections
@@ -794,16 +845,26 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
     float *scores = vbuf + (size_t)n * kvh * hd;                    // [n, h, kv_len]
     float *attn_out = scores + (size_t)n * h * kv_len;              // [n, h*hd]
     linear_forward(l->q_proj, n, h * hd * 2, d, x, qbuf, 64);
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_qraw_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(qbuf, sizeof(float), (size_t)n * h * hd * 2, f);
+                fclose(f);
+            }
+        }
+    }
     linear_forward(l->k_proj, n, kvh * hd, d, x, kbuf, 64);
     linear_forward(l->v_proj, n, kvh * hd, d, x, vbuf, 64);
-    // append k/v to cache
+    // append v to cache (k is cached after norm+rope below)
     if (l->kv_len + n > QMODEL_KV_CAP) {
         int drop = l->kv_len + n - QMODEL_KV_CAP;
-        memmove(l->k_cache, l->k_cache + (size_t)drop * kvh * hd, (size_t)(l->kv_len - drop) * kvh * hd * sizeof(float));
         memmove(l->v_cache, l->v_cache + (size_t)drop * kvh * hd, (size_t)(l->kv_len - drop) * kvh * hd * sizeof(float));
         l->kv_len -= drop;
     }
-    memcpy(l->k_cache + (size_t)l->kv_len * kvh * hd, kbuf, (size_t)n * kvh * hd * sizeof(float));
     memcpy(l->v_cache + (size_t)l->kv_len * kvh * hd, vbuf, (size_t)n * kvh * hd * sizeof(float));
     int kv_total = l->kv_len + n;
     l->kv_len = kv_total;
@@ -830,11 +891,24 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
         }
         free(inv);
     }
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/rope_cs_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(rope_cos, sizeof(float), (size_t)n * (rot_dim / 2), f);
+                fwrite(rope_sin, sizeof(float), (size_t)n * (rot_dim / 2), f);
+                fclose(f);
+            }
+        }
+    }
     for (int t = 0; t < n; t++) {
         const float *qrow = qbuf + (size_t)t * h * hd * 2;
         float *qrow_n = q_normed + (size_t)t * h * hd;
         for (int hh = 0; hh < h; hh++) {
-            kernel_rmsnorm(qrow + (size_t)hh * hd, l->q_norm, (size_t)hd, 1e-6f, qrow_n + (size_t)hh * hd);
+            kernel_rmsnorm(qrow + (size_t)hh * hd * 2, l->q_norm, (size_t)hd, 1e-6f, qrow_n + (size_t)hh * hd);
         }
         kernel_rope_partial(qrow_n, h, hd, (size_t)rot_dim, rope_cos + (size_t)t * (rot_dim / 2), rope_sin + (size_t)t * (rot_dim / 2), qrow_n);
         const float *krow = kbuf + (size_t)t * kvh * hd;
@@ -843,6 +917,21 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
             kernel_rmsnorm(krow + (size_t)hh * hd, l->k_norm, (size_t)hd, 1e-6f, krow_n + (size_t)hh * hd);
         }
         kernel_rope_partial(krow_n, kvh, hd, (size_t)rot_dim, rope_cos + (size_t)t * (rot_dim / 2), rope_sin + (size_t)t * (rot_dim / 2), krow_n);
+    }
+    memcpy(l->k_cache + (size_t)(l->kv_len - n) * kvh * hd, k_normed,
+           (size_t)n * kvh * hd * sizeof(float));
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_qk_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(q_normed, sizeof(float), (size_t)n * h * hd, f);
+                fwrite(k_normed, sizeof(float), (size_t)n * kvh * hd, f);
+                fclose(f);
+            }
+        }
     }
     
     // scores: [n, h, kv_total] with causal mask and sparse indexer mask
@@ -894,7 +983,20 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
             }
             free(inv);
         }
-        kernel_rope_partial(pooled, (size_t)n_blocks, (size_t)c->indexer_head_dim, (size_t)rot_dim, bcos, bsin, pooled);
+        {
+            const char *dd = getenv("QWEN_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/idx_bcos_n%zu.bin", dd, (size_t)n);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(bcos, sizeof(float), (size_t)n_blocks * (rot_dim / 2), f);
+                    fwrite(bsin, sizeof(float), (size_t)n_blocks * (rot_dim / 2), f);
+                    fclose(f);
+                }
+            }
+        }
+        kernel_rope_partial_rows(pooled, (size_t)n_blocks, (size_t)c->indexer_head_dim, (size_t)rot_dim, bcos, bsin, pooled);
         float *qscore = xmalloc((size_t)c->indexer_n_heads * c->indexer_head_dim * sizeof(float));
         float *bscores = xmalloc((size_t)n_blocks * sizeof(float));
         int *top = xmalloc((size_t)block_topk * sizeof(int));
@@ -907,6 +1009,24 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
                                qscore + (size_t)hh * c->indexer_head_dim);
             }
             kernel_rope_partial(qscore, c->indexer_n_heads, (size_t)c->indexer_head_dim, (size_t)rot_dim, rope_cos + (size_t)t * (rot_dim / 2), rope_sin + (size_t)t * (rot_dim / 2), qscore);
+        {
+            const char *dd = getenv("QWEN_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/idx_q_t%d_n%zu.bin", dd, t, (size_t)n);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(qscore, sizeof(float), (size_t)c->indexer_n_heads * c->indexer_head_dim, f);
+                    fclose(f);
+                }
+                snprintf(path, sizeof(path), "%s/idx_pooled_n%zu.bin", dd, (size_t)n);
+                f = fopen(path, "wb");
+                if (f) {
+                    fwrite(pooled, sizeof(float), (size_t)n_blocks * c->indexer_head_dim, f);
+                    fclose(f);
+                }
+            }
+        }
             // scores over blocks
             float *bscores = xmalloc((size_t)n_blocks * sizeof(float));
             for (int b = 0; b < n_blocks; b++) {
@@ -929,6 +1049,18 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
             // topk blocks
             int *top = xmalloc((size_t)block_topk * sizeof(int));
             kernel_topk_indices(bscores, (size_t)n_blocks, (size_t)block_topk, top);
+            {
+                const char *dd = getenv("QWEN_DUMP_DIR");
+                if (dd) {
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s/idx_scores_t%d_n%zu.bin", dd, t, (size_t)n);
+                    FILE *f = fopen(path, "wb");
+                    if (f) {
+                        fwrite(bscores, sizeof(float), (size_t)n_blocks, f);
+                        fclose(f);
+                    }
+                }
+            }
             // apply mask: keep blocks + own tail
             for (int hh = 0; hh < h; hh++) {
                 float *srow = scores + ((size_t)t * h + hh) * kv_total;
@@ -953,6 +1085,24 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
         free(pooled);
         free(bcos);
         free(bsin);
+        {
+            const char *dd = getenv("QWEN_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/attn_mask_n%zu.bin", dd, (size_t)n);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    uint8_t *mask = xmalloc((size_t)n * h * kv_total);
+                    for (int t = 0; t < n; t++)
+                        for (int hh = 0; hh < h; hh++)
+                            for (int kk = 0; kk < kv_total; kk++)
+                                mask[((size_t)t * h + hh) * kv_total + kk] =
+                                    isinf(scores[((size_t)t * h + hh) * kv_total + kk]) ? 0 : 1;
+                    fwrite(mask, 1, (size_t)n * h * kv_total, f);
+                    free(mask);
+                }
+            }
+        }
     }
     
     // softmax + weighted sum of v
@@ -978,11 +1128,15 @@ static void attention_forward(qmodel *m, qlayer *l, const float *x, int n,
         }
     }
     // gate the attention output (before o_proj), then project
-    float *gatebuf = qbuf + (size_t)h * hd; // second half of each token's q_proj out
+    // q_proj rows interleave q and gate per head: [h0 q|gate h1 q|gate ...]
     for (int t = 0; t < n; t++) {
-        for (int i = 0; i < h * hd; i++) {
-            float g = 1.0f / (1.0f + expf(-gatebuf[(size_t)t * h * hd * 2 + i]));
-            attn_out[(size_t)t * h * hd + i] *= g;
+        for (int hh = 0; hh < h; hh++) {
+            const float *grow = qbuf + (size_t)t * h * hd * 2 + (size_t)hh * hd * 2 + hd;
+            float *orow = attn_out + ((size_t)t * h + hh) * hd;
+            for (int i = 0; i < hd; i++) {
+                float g = 1.0f / (1.0f + expf(-grow[i]));
+                orow[i] *= g;
+            }
         }
     }
     
@@ -1031,6 +1185,18 @@ static void deltanet_forward(qmodel *m, qlayer *l, const float *x, int n,
     // input positions kconv-1 .. kconv-1+n-1 -> conv_out rows (kconv-1)..(kconv-1+n-1)
     memmove(conv_out, conv_out + (size_t)(kconv - 1) * conv_dim, (size_t)n * conv_dim * sizeof(float));
     kernel_silu(conv_out, (size_t)n * conv_dim, conv_out);
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/deltanet_conv_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(conv_out, sizeof(float), (size_t)n * conv_dim, f);
+                fclose(f);
+            }
+        }
+    }
     // split q/k/v
     
     // q/k/v are interleaved per token in the conv output [n, conv_dim]
@@ -1083,6 +1249,18 @@ static void deltanet_forward(qmodel *m, qlayer *l, const float *x, int n,
     }
     
     // rmsnorm_gated + out_proj
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/deltanet_rec_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(out_raw, sizeof(float), (size_t)n * hv * dv, f);
+                fclose(f);
+            }
+        }
+    }
     for (int t = 0; t < n; t++) {
         for (int h = 0; h < hv; h++) {
             float *orow = out_raw + ((size_t)t * hv + h) * dv;
@@ -1254,6 +1432,18 @@ static int ple_forward(qmodel *m, qlayer *l, float *h, const int64_t *tokens,
         ngram_indices(&g, hist, (size_t)(ctx_len + n), gids);
         // take last n positions
         memmove(gids, gids + (size_t)ctx_len * g.ngram_heads, (size_t)n * g.ngram_heads * sizeof(int64_t));
+        {
+            const char *dd = getenv("QWEN_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/ple_gids_n%zu.bin", dd, (size_t)n);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(gids, sizeof(int64_t), (size_t)n * g.ngram_heads, f);
+                    fclose(f);
+                }
+            }
+        }
     }
     // gather rows -> emb [n, nhead * row_width] = [n, ple_embed_dim]
     int nhead = (c->ngram_size - 1) * c->heads_per_ngram;
@@ -1267,6 +1457,18 @@ static int ple_forward(qmodel *m, qlayer *l, float *h, const int64_t *tokens,
         free(hist);
         free(gids);
         return -1;
+    }
+    {
+        const char *dd = getenv("QWEN_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/ple_emb_n%zu.bin", dd, (size_t)n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(emb, sizeof(float), (size_t)n * c->ple_embed_dim, f);
+                fclose(f);
+            }
+        }
     }
     
     // key = norm_key(key_proj(emb)) [n, hc, d]
@@ -1351,6 +1553,8 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         err_set(err, "model_forward: decode expects one token");
         return -1;
     }
+    static const char *dump_dir = NULL;
+    if (!dump_dir) dump_dir = getenv("QWEN_DUMP_DIR");
     int d = c->hidden_size;
     int hc = c->hc_count;
     int hc_dim = hc * d;
@@ -1425,6 +1629,15 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         }
         free(emb);
     }
+    if (dump_dir) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/embed_n%zu.bin", dump_dir, n);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(h, sizeof(float), (size_t)n * hc_dim, f);
+            fclose(f);
+        }
+    }
     // per layer
     
     float *fn_scratch = h2 + (size_t)n * hc_dim;
@@ -1457,12 +1670,30 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         float *attn_out = inject + (size_t)n * hc; // [n, d]
         gated_residual(h, l->ah_norm, l->ah_down, l->ah_up, l->ah_inject, hc, d,
                        c->hc_lowrank, (int)n, mixed, inject, fn_scratch);
+        if (dump_dir) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/mixed_%02d_n%zu.bin", dump_dir, i, n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(mixed, sizeof(float), (size_t)n * d, f);
+                fclose(f);
+            }
+        }
         
         if (c->layer_types[i] == 1) {
             attention_forward(m, l, mixed, (int)n, offset, attn_out, fn_scratch);
         } else {
             
             deltanet_forward(m, l, mixed, (int)n, attn_out, fn_scratch);
+        }
+        if (dump_dir) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_%02d_n%zu.bin", dump_dir, i, n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(attn_out, sizeof(float), (size_t)n * d, f);
+                fclose(f);
+            }
         }
         
         // h = hyper + attn_out * inject
@@ -1479,6 +1710,15 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
         gated_residual(h, l->mh_norm, l->mh_down, l->mh_up, l->mh_inject, hc, d,
                        c->hc_lowrank, (int)n, mixed, inject, fn_scratch);
         if (moe_forward(m, l, mixed, (int)n, attn_out, fn_scratch, err) != 0) goto out;
+        if (dump_dir) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/moe_%02d_n%zu.bin", dump_dir, i, n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(attn_out, sizeof(float), (size_t)n * d, f);
+                fclose(f);
+            }
+        }
         
         
         for (int t = 0; t < (int)n; t++) {
@@ -1489,10 +1729,28 @@ int model_forward(qmodel *m, const int64_t *tokens, size_t n, int decode,
                 }
             }
         }
+        if (dump_dir) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/layer_%02d_n%zu.bin", dump_dir, i, n);
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                fwrite(h, sizeof(float), (size_t)n * hc_dim, f);
+                fclose(f);
+            }
+        }
     }
     // final mixer (no inject)
     gated_residual(h, m->mix_norm, m->mix_down, m->mix_up, NULL, hc, d,
                    c->hc_lowrank, (int)n, h2, NULL, fn_scratch);
+    if (dump_dir) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/layer_final_n%zu.bin", dump_dir, n);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            fwrite(h2, sizeof(float), (size_t)n * d, f);
+            fclose(f);
+        }
+    }
     // lm_head
     linear_forward(m->lm_head, (int)n, (int)c->vocab_size, d, h2, logits, 64);
     if (decode) m->stats.decode_calls++;
@@ -1666,6 +1924,18 @@ qmodel *model_load(const char *dir, int io_workers, uint64_t expert_budget,
         // hyper connections
         snprintf(nm, sizeof(nm), "model.layers.%d.attn_hyper_connection.hc_norm.weight", i);
         if (mw_load_f32(&l->ah_norm, &(size_t){0}, &m->ix, nm, err) != 0) goto fail;
+        {
+            const char *dd = getenv("QWEN_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/w_ah_norm_%d.bin", dd, i);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(l->ah_norm, sizeof(float), (size_t)128, f);
+                    fclose(f);
+                }
+            }
+        }
         snprintf(nm, sizeof(nm), "model.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", i);
         if (mw_load(&m->mw, &m->ix, nm, err) != 0) goto fail;
         snprintf(nm, sizeof(nm), "model.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", i);
