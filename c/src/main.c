@@ -5,6 +5,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "chat.h"
 #include "model.h"
 #include "tokenizer.h"
 #include "util.h"
@@ -13,12 +14,14 @@ typedef struct {
     const char *model_dir;
     const char *prompt;
     const char *command;
+    const char *system;
     int max_tokens;
     int runs;
     double temperature;
     double top_p;
     uint64_t seed;
     int chat;
+    int thinking;
     int io_workers;
     double expert_budget_gib;
     double ple_budget_gib;
@@ -33,6 +36,9 @@ static void usage(const char *prog) {
             "options:\n"
             "  --model DIR          model directory (config.json + safetensors)\n"
             "  --prompt TEXT        prompt (generate) or token ids as text (benchmark)\n"
+            "  --chat               wrap the prompt as a chat turn (generate only)\n"
+            "  --system TEXT        system message for --chat\n"
+            "  --no-thinking        disable the thinking block in --chat\n"
             "  --max-tokens N       tokens to generate (default 64)\n"
             "  --temperature T      sampling temperature (default 0)\n"
             "  --top-p P            nucleus sampling (default 1)\n"
@@ -49,6 +55,7 @@ static void usage(const char *prog) {
 static int parse_cli(int argc, char **argv, cli_opts *o) {
     memset(o, 0, sizeof(*o));
     o->max_tokens = 64;
+    o->thinking = 1;
     o->temperature = 0.0;
     o->top_p = 1.0;
     o->runs = 1;
@@ -71,11 +78,13 @@ static int parse_cli(int argc, char **argv, cli_opts *o) {
         {"expert-prefetch", required_argument, NULL, 'x'},
         {"ple-prefetch", required_argument, NULL, 'y'},
         {"chat", no_argument, NULL, 'c'},
+        {"system", required_argument, NULL, 'S'},
+        {"no-thinking", no_argument, NULL, 'T'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     int c;
-    while ((c = getopt_long(argc, argv, "m:p:n:t:P:s:r:e:l:w:x:y:ch", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "m:p:n:t:P:s:r:e:l:w:x:y:cS:Th", longopts, NULL)) != -1) {
         switch (c) {
             case 'm': o->model_dir = optarg; break;
             case 'p': o->prompt = optarg; break;
@@ -90,6 +99,8 @@ static int parse_cli(int argc, char **argv, cli_opts *o) {
             case 'x': o->expert_prefetch = atoi(optarg); break;
             case 'y': o->ple_prefetch = atoi(optarg); break;
             case 'c': o->chat = 1; break;
+            case 'S': o->system = optarg; break;
+            case 'T': o->thinking = 0; break;
             case 'h': usage(argv[0]); return -1;
             default: usage(argv[0]); return -1;
         }
@@ -106,6 +117,14 @@ static int parse_cli(int argc, char **argv, cli_opts *o) {
     }
     if (strcmp(o->command, "benchmark") == 0 && !o->prompt) {
         fprintf(stderr, "benchmark requires --prompt (comma-separated token ids)\n");
+        return -1;
+    }
+    if (o->chat && strcmp(o->command, "generate") != 0) {
+        fprintf(stderr, "--chat only applies to generate\n");
+        return -1;
+    }
+    if (o->system && !o->chat) {
+        fprintf(stderr, "--system requires --chat\n");
         return -1;
     }
     return 0;
@@ -257,11 +276,20 @@ int main(int argc, char **argv) {
     int64_t ids[4096];
     int n_ids = 0;
     tokenizer *tok = tokenizer_load(o.model_dir);
+    int64_t chat_stop = -1;
+    char *rendered = NULL;
+    const char *prompt = o.prompt;
+    if (o.chat) {
+        rendered = chat_render(o.system, o.prompt, o.thinking);
+        prompt = rendered;
+        if (tok) chat_stop = tokenizer_special(tok, "<|im_end|>");
+    }
     if (strcmp(o.command, "generate") == 0) {
         if (tok) {
-            n_ids = tokenizer_encode(tok, o.prompt, ids, 4096);
+            n_ids = tokenizer_encode(tok, prompt, ids, 4096);
             if (n_ids < 0) {
                 fprintf(stderr, "tokenizer failed\n");
+                free(rendered);
                 tokenizer_free(tok);
                 model_free(m);
                 return 1;
@@ -269,24 +297,27 @@ int main(int argc, char **argv) {
             model_set_tokenizer(m, tok);
         } else {
             fprintf(stderr, "warning: no tokenizer available, using raw byte ids\n");
-            n_ids = (int)strlen(o.prompt);
-            for (int i = 0; i < n_ids && i < 4096; i++) ids[i] = (unsigned char)o.prompt[i];
+            n_ids = (int)strlen(prompt);
+            for (int i = 0; i < n_ids && i < 4096; i++) ids[i] = (unsigned char)prompt[i];
         }
     } else {
         n_ids = parse_ids(o.prompt, ids, 4096);
         if (n_ids < 0) {
             fprintf(stderr, "cannot parse prompt as token ids\n");
+            free(rendered);
             model_free(m);
             return 1;
         }
     }
     if (n_ids < 1) {
         fprintf(stderr, "empty prompt\n");
+        free(rendered);
         model_free(m);
         return 1;
     }
+    free(rendered);
 
-    float *logits = xmalloc((size_t)vocab * sizeof(float));
+    float *logits = xmalloc((size_t)n_ids * vocab * sizeof(float));
     uint64_t rng = o.seed;
     double prefill_seconds = 0, gen_seconds = 0;
     int gen_tokens = 0;
@@ -328,7 +359,14 @@ int main(int argc, char **argv) {
 
     if (strcmp(o.command, "generate") == 0) {
         if (tok) {
-            char *text = tokenizer_decode(tok, generated, (size_t)gen_tokens);
+            int n_print = gen_tokens;
+            if (o.chat) {
+                while (n_print > 0 && (generated[n_print - 1] == eos ||
+                                       generated[n_print - 1] == chat_stop)) {
+                    n_print--;
+                }
+            }
+            char *text = tokenizer_decode(tok, generated, (size_t)n_print);
             if (text) {
                 printf("%s\n", text);
                 free(text);
