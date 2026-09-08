@@ -345,7 +345,7 @@ int main(int argc, char **argv) {
             }
             generated[step] = token;
             gen_tokens++;
-            if (token == eos) break;
+            if (token == eos || token == chat_stop) break;
             if (step + 1 < o.max_tokens) {
                 if (model_forward(m, &token, 1, 1, dlogits, &err) != 0) {
                     fprintf(stderr, "decode failed: %s\n", err.msg);
