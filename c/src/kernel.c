@@ -92,6 +92,23 @@ void kernel_rope_partial(const float *x, size_t rows, size_t n, size_t d,
     }
 }
 
+void kernel_rope_partial_rows(const float *x, size_t rows, size_t n, size_t d,
+                              const float *cos, const float *sin, float *y) {
+    size_t half = d / 2;
+    for (size_t r = 0; r < rows; r++) {
+        const float *xr = x + r * n;
+        const float *cr = cos + r * half;
+        const float *sr = sin + r * half;
+        float *yr = y + r * n;
+        for (size_t i = 0; i < half; i++) {
+            float x0 = xr[i], x1 = xr[i + half];
+            yr[i] = x0 * cr[i] - x1 * sr[i];
+            yr[i + half] = x0 * sr[i] + x1 * cr[i];
+        }
+        if (d < n) memcpy(yr + d, xr + d, (n - d) * sizeof(float));
+    }
+}
+
 // quickselect-based partial selection: partition so the k largest values'
 // indices occupy out[0..k)
 static void kth_largest(const float *x, int *idx, size_t n, size_t k) {

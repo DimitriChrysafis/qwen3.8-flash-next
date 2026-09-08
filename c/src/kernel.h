@@ -32,6 +32,11 @@ void kernel_l2norm(const float *x, size_t n, float eps, float *y);
 void kernel_rope_partial(const float *x, size_t rows, size_t n, size_t d,
                          const float *cos, const float *sin, float *y);
 
+// like kernel_rope_partial but each row r uses cos[r*d/2 ..] / sin[r*d/2 ..]
+// (per-row positions)
+void kernel_rope_partial_rows(const float *x, size_t rows, size_t n, size_t d,
+                              const float *cos, const float *sin, float *y);
+
 // ---- topk ----
 
 // return the indices of the k largest values of x (order within top-k
