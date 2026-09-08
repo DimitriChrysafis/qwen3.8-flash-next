@@ -47,7 +47,8 @@ static void build_tiny_dir(const char *dir) {
     ng.eos_token_id = 1;
     ngram_geo_compute(&ng, 31, 1234, 0);
     int row_width = 64 / ((ng.ngram_size - 1) * ng.heads_per_ngram);
-    int rps = (int)(ng.total_rows / 2);
+    int64_t padded = (ng.total_rows + 7) / 8 * 8;
+    int rps = (int)((padded + 1) / 2);
 
     tplan *plan = xcalloc(1 << 12, sizeof(tplan));
     size_t np = 0;
