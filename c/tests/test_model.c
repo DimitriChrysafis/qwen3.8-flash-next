@@ -4,7 +4,7 @@
 //
 // with a directory argument the logits are also dumped to
 // /tmp/qwen_logits_c.bin and /tmp/qwen_decode_c.bin for parity checking
-// against the colibri reference (see gen_tiny.py).
+// against an external reference.
 
 #include <math.h>
 #include <stdio.h>
@@ -28,6 +28,7 @@ static float frand(void) {
 typedef struct {
     char name[160];
     int is_i64;
+    int is_q4;
     int ndim;
     int64_t shape[3];
     size_t n; // element count
@@ -159,6 +160,30 @@ static void build_tiny_dir(const char *dir) {
     TP("model.hyper_connection_mixer.input_mix_weight_up.weight", 0, 2, HCD, LR, 0, (size_t)HCD * LR);
 #undef TP
 
+    for (size_t i = 0; i < np; i++) {
+        if (strstr(plan[i].name, "switch_mlp.") && !strstr(plan[i].name, ".scales") &&
+            !strstr(plan[i].name, ".biases")) {
+            plan[i].is_q4 = 1;
+            plan[i].shape[2] /= 8;
+            plan[i].n /= 8;
+        }
+    }
+    for (size_t i = 0; i < np; i++) {
+        if (!plan[i].is_q4) continue;
+        size_t nl = strlen(plan[i].name);
+        if (nl > 7 && strcmp(plan[i].name + nl - 7, ".weight") == 0) nl -= 7;
+        for (int side = 0; side < 2; side++) {
+            tplan *tp = &plan[np++];
+            snprintf(tp->name, sizeof(tp->name), "%.*s.%s", (int)nl,
+                     plan[i].name, side == 0 ? "scales" : "biases");
+            tp->ndim = 3;
+            tp->shape[0] = plan[i].shape[0];
+            tp->shape[1] = plan[i].shape[1];
+            tp->shape[2] = 1;
+            tp->n = (size_t)(plan[i].shape[0] * plan[i].shape[1]);
+        }
+    }
+
     // compute offsets and write the header
     uint64_t off = 0;
     char *hdr = xmalloc(1 << 20);
@@ -167,8 +192,8 @@ static void build_tiny_dir(const char *dir) {
     for (size_t i = 0; i < np; i++) {
         tplan *tp = &plan[i];
         if (i) hdr[hp++] = ',';
-        const char *dt = tp->is_i64 ? "I64" : "BF16";
-        size_t el = tp->is_i64 ? 8 : 2;
+        const char *dt = tp->is_i64 ? "I64" : tp->is_q4 ? "U32" : "BF16";
+        size_t el = tp->is_i64 ? 8 : tp->is_q4 ? 4 : 2;
         hp += (size_t)snprintf(hdr + hp, (1 << 20) - hp,
                                "\"%s\":{\"dtype\":\"%s\",\"shape\":[", tp->name, dt);
         for (int d = 0; d < tp->ndim; d++) {
@@ -209,12 +234,31 @@ static void build_tiny_dir(const char *dir) {
                 vals[1] = ng.offsets[1];
             }
             fwrite(vals, 8, tp->n, f);
+        } else if (tp->is_q4) {
+            for (size_t e = 0; e < (size_t)tp->shape[0]; e++) {
+                for (size_t r = 0; r < (size_t)tp->shape[1]; r++) {
+                    for (size_t k = 0; k < D; k++) buf[k] = frand() * 0.3f;
+                    uint32_t word[4] = {0};
+                    for (size_t k = 0; k < D; k++) {
+                        int nib = (int)(buf[k] * 8.0f);
+                        if (nib < 0) nib = 0;
+                        if (nib > 15) nib = 15;
+                        word[k / 8] |= (uint32_t)nib << (4 * (k % 8));
+                    }
+                    fwrite(word, 4, 4, f);
+                }
+            }
         } else {
             for (size_t k = 0; k < tp->n; k++) buf[k] = frand() * 0.3f;
             // norms are centered around 1
             if (strstr(tp->name, "norm.weight") || strstr(tp->name, ".A_log") ||
                 strstr(tp->name, ".dt_bias")) {
                 for (size_t k = 0; k < tp->n; k++) buf[k] += 1.0f;
+            }
+            if (strstr(tp->name, ".scales")) {
+                for (size_t k = 0; k < tp->n; k++) buf[k] = 0.125f;
+            } else if (strstr(tp->name, ".biases")) {
+                for (size_t k = 0; k < tp->n; k++) buf[k] = 0.0f;
             }
             for (size_t k = 0; k < tp->n; k++) {
                 uint16_t b = f32_to_bf16(buf[k]);
@@ -247,7 +291,8 @@ static void build_tiny_dir(const char *dir) {
             "\"output_gate_type\":\"sigmoid\",\"eos_token_id\":1,\"bos_token_id\":1,"
             "\"rope_parameters\":{\"rope_theta\":10000.0,"
             "\"partial_rotary_factor\":0.5},\"rms_norm_eps\":1e-6,"
-            "\"tie_word_embeddings\":false},\"vision_config\":{},\"quantization\":{}}");
+            "\"tie_word_embeddings\":false},\"vision_config\":{},\"quantization\":{"
+            "\"group_size\":32,\"bits\":4}}");
     fclose(f);
 }
 
