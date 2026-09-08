@@ -14,4 +14,4 @@ five runs per prompt, four generated tokens, m3 max, 36 gb unified memory, mlx 0
 
 the short case reached zero additional disk reads on its final three runs. medium and long remain ssd-bound because their routed expert sets exceed the 8 gib cache. the raw report is in `artifacts/benchmark_results.json`.
 
-29 tests pass, including tiny-model parity against transformers, native and python row-reader parity, malformed safetensor validation, cache behavior, async prefetch, and generation validation.
+38 tests pass, including tiny-model parity against transformers, native and python row-reader parity, malformed safetensor validation, cache behavior, async prefetch, special-token encode, chat template rendering, and generation validation.
