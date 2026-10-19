@@ -1,6 +1,6 @@
 # qwen3.8-flash-next
 
-runs qwen3.8-flash-next on an m3 max. the model is a 180b mixture-of-experts and doesn't fit in ram, so the routed experts stay on the ssd and get read in as the router needs them. this is the python runtime. the c port in `c/` has no numbers yet.
+runs qwen3.8-flash-next on an m3 max. the model is a 125b-parameter mixture-of-experts, 104 gb at 4-bit, and doesn't fit in ram, so the routed experts stay on the ssd and get read in as the router needs them. this is the python runtime. the c port in `c/` has no numbers yet.
 
 ## benchmark
 
