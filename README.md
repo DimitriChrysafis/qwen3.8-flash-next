@@ -4,15 +4,6 @@ colibri runs qwen3.8-flash-next on apple silicon. the model is a 180b mixture-of
 
 this is the python runtime. a c port is in progress under `c/`, and it has no published numbers yet.
 
-## where the memory goes
-
-```
-ssd                                 ram (36 gb)
-routed experts  ── async reads ──►  8 gib expert cache
-ple rows        ── async reads ──►  1 gib ple cache
-                                    the rest of the model, mlx
-```
-
 ## benchmark
 
 ![benchmark](images/benchmark.png)
